@@ -336,6 +336,8 @@ const BASE_CSS: &str = r#"
 columnview.plume-procs > listview > row > cell { padding: 0; }
 columnview.plume-procs label.plume-cell { padding: 4px 8px; }
 columnview.plume-procs > listview > row:not(:selected):not(:hover) > cell > label.plume-odd { background-color: alpha(@view_fg_color, 0.055); }
+/* Where a dragged Overview card will land. */
+.plume-drop-outline { border: 2px solid @accent_color; border-radius: 12px; background-color: alpha(@accent_color, 0.10); }
 window.plume-float { border-radius: 14px; }
 window.plume-float .plume-float-title { font-weight: 700; font-size: 0.85em; opacity: 0.75; margin: 8px 4px 4px 12px; }
 window.plume-float .plume-float-value { font-weight: 700; font-size: 1.1em; font-feature-settings: "tnum"; margin: 6px 12px 2px 4px; }

@@ -49,7 +49,7 @@ pub fn build() -> gtk::Widget {
     flow.set_margin_start(12);
     flow.set_margin_end(12);
 
-    let add = |w: &gtk::Box| flow.append(w);
+    let add = |w: &gtk::Box, key: &str| flow.append(w, key);
 
     // ---------------------------------------------------------------- CPU
     {
@@ -148,7 +148,7 @@ pub fn build() -> gtk::Widget {
                 }
             }
         }));
-        add(&c.root);
+        add(&c.root, "cpu");
     }
 
     // ------------------------------------------------------------- Memory
@@ -186,7 +186,7 @@ pub fn build() -> gtk::Widget {
                 card::set(&swap, "None");
             }
         }));
-        add(&c.root);
+        add(&c.root, "mem");
     }
 
     // --------------------------------------------------------------- GPUs
@@ -278,7 +278,7 @@ pub fn build() -> gtk::Widget {
                 card::set(l, &g.power_w.map(|w| format!("{w:.1} W")).unwrap_or_else(|| "–".into()));
             }
         }));
-        add(&c.root);
+        add(&c.root, &format!("gpu{i}"));
     }
 
     // ------------------------------------------------------------ Network
@@ -319,7 +319,7 @@ pub fn build() -> gtk::Widget {
             card::set_with_tip(&ifaces, &names);
             card::set_with_tip(&sub, &names);
         }));
-        add(&c.root);
+        add(&c.root, "net");
     }
 
     // --------------------------------------------------------------- Disk
@@ -400,8 +400,12 @@ pub fn build() -> gtk::Widget {
                 card::set(lbl, &format!("{} free of {}", format::bytes(f.avail), format::bytes(f.total)));
             }
         }));
-        add(&c.root);
+        add(&c.root, "disk");
     }
+
+    // Cards are reordered by dragging their headers; the order is remembered.
+    flow.set_order(&crate::settings::with(|s| s.card_order.clone()));
+    flow.connect_reordered(|keys| crate::settings::update(|s| s.card_order = keys));
 
     let scroller = gtk::ScrolledWindow::new();
     scroller.set_hscrollbar_policy(gtk::PolicyType::Never);

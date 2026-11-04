@@ -26,7 +26,11 @@ pub fn card(title: &str, float_id: Option<&str>, value_chars: i32) -> Card {
     root.add_css_class("plume-card");
     root.set_hexpand(true);
 
+    // The header is the card's drag handle (see widgets::tiles): an open hand
+    // on hover, except over its buttons.
     let header = gtk::Box::new(gtk::Orientation::Horizontal, 8);
+    header.add_css_class(crate::widgets::tiles::HANDLE);
+    header.set_cursor_from_name(Some("grab"));
     let titles = gtk::Box::new(gtk::Orientation::Vertical, 2);
     titles.set_hexpand(true);
     let t = gtk::Label::new(Some(title));
@@ -50,6 +54,7 @@ pub fn card(title: &str, float_id: Option<&str>, value_chars: i32) -> Card {
 
     let header_extra = gtk::Box::new(gtk::Orientation::Horizontal, 4);
     header_extra.set_valign(gtk::Align::Center);
+    header_extra.set_cursor_from_name(Some("default"));
     header.append(&header_extra);
 
     if let Some(id) = float_id {
@@ -59,6 +64,7 @@ pub fn card(title: &str, float_id: Option<&str>, value_chars: i32) -> Card {
         b.set_tooltip_text(Some("Pop out as a floating readout"));
         b.set_action_name(Some("app.float"));
         b.set_action_target_value(Some(&id.to_variant()));
+        b.set_cursor_from_name(Some("default"));
         header.append(&b);
     }
     root.append(&header);

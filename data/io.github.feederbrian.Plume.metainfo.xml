@@ -39,6 +39,11 @@
   </screenshots>
   <content_rating type="oars-1.1"/>
   <releases>
+    <release version="0.2.1" date="2026-11-04">
+      <description>
+        <p>Resizable floating readouts (drag the bottom-right corner; sizes are remembered) and Overview cards you can reorder by dragging their headers.</p>
+      </description>
+    </release>
     <release version="0.2.0" date="2026-11-04">
       <description>
         <p>GPU-rendered graphs with exact, thin lines and even motion; stable layout; a much faster process list; real Intel/AMD engine utilisation and per-process GPU; an OLED Black theme.</p>

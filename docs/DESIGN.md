@@ -136,6 +136,23 @@ width only (`widgets/tiles.rs`). Every value label has a fixed width with
 tabular digits, and stats sit in a fixed 4-column grid. `PLUME_PROFILE=1`
 counts graph resizes, which should stay at 0.
 
+Cards are reordered by dragging their headers, and the same rule applies:
+nothing moves until the drop. The container dims the dragged card and
+places a single outline widget over the slot under the pointer, so a drag
+costs one re-allocation per slot change and never resizes a graph. On
+release the cards are reordered once, and the order is saved by card id.
+
+## Floating readouts
+
+Readouts are undecorated windows, so they have no resize borders. An
+invisible 16 px grip in the bottom-right corner calls
+`gdk_toplevel_begin_resize` (`xdg_toplevel.resize` on Wayland). The
+compositor runs the resize, so it is as smooth as any window's. GtkWindow
+clips hit-testing to its rounded corners, which would leave the very corner
+dead, so readouts turn that clipping off; nothing inside them reaches the
+corners. A resize reports a new size every frame, so the size is saved half
+a second after the last change.
+
 ## GPUs
 
 * **NVIDIA (Optimus / RTD3):** any NVML query keeps a sleeping dGPU awake. Plume

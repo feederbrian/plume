@@ -35,6 +35,10 @@ pub struct Settings {
     pub sorts: BTreeMap<String, String>,
     /// Per-float time scale in seconds (float id → secs).
     pub float_scales: BTreeMap<String, u32>,
+    /// Per-float window size set by the user (float id → width, height).
+    pub float_sizes: BTreeMap<String, (i32, i32)>,
+    /// Overview card order (card ids); cards not listed keep their default place.
+    pub card_order: Vec<String>,
 }
 
 impl Default for Settings {
@@ -61,6 +65,8 @@ impl Default for Settings {
             height: 720,
             sorts: BTreeMap::new(),
             float_scales: BTreeMap::new(),
+            float_sizes: BTreeMap::new(),
+            card_order: Vec::new(),
         }
     }
 }
@@ -103,6 +109,9 @@ fn load() -> Settings {
     if let Some(v) = str_("floats") {
         s.floats = v.split(',').filter(|x| !x.is_empty()).map(str::to_string).collect();
     }
+    if let Some(v) = str_("card_order") {
+        s.card_order = v.split(',').filter(|x| !x.is_empty()).map(str::to_string).collect();
+    }
     if let Some(v) = str_("page") {
         // 0.1 page names → tabs
         s.page = match v.as_str() {
@@ -123,6 +132,15 @@ fn load() -> Settings {
             if let Some(id) = k.strip_prefix("floatscale_") {
                 if let Some(v) = int(k) {
                     s.float_scales.insert(id.to_string(), v.clamp(10, 3600) as u32);
+                }
+            }
+            if let Some(id) = k.strip_prefix("floatsize_") {
+                let size = str_(k).and_then(|v| {
+                    let (w, h) = v.split_once('x')?;
+                    Some((w.trim().parse::<i32>().ok()?, h.trim().parse::<i32>().ok()?))
+                });
+                if let Some((w, h)) = size {
+                    s.float_sizes.insert(id.to_string(), (w.clamp(48, 8192), h.clamp(32, 8192)));
                 }
             }
         }
@@ -148,6 +166,7 @@ fn save(s: &Settings) {
     kf.set_boolean(G, "confirm_kill", s.confirm_kill);
     kf.set_double(G, "float_opacity", s.float_opacity);
     kf.set_string(G, "floats", &s.floats.join(","));
+    kf.set_string(G, "card_order", &s.card_order.join(","));
     kf.set_string(G, "page", &s.page);
     kf.set_integer(G, "width", s.width);
     kf.set_integer(G, "height", s.height);
@@ -156,6 +175,9 @@ fn save(s: &Settings) {
     }
     for (id, v) in &s.float_scales {
         kf.set_integer(G, &format!("floatscale_{id}"), *v as i32);
+    }
+    for (id, (w, h)) in &s.float_sizes {
+        kf.set_string(G, &format!("floatsize_{id}"), &format!("{w}x{h}"));
     }
     let p = path();
     if let Some(dir) = p.parent() {

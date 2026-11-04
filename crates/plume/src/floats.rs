@@ -6,18 +6,25 @@
 //! by their title prefix and makes them always-on-top, sticky across
 //! workspaces, and restores their last position. Without it they behave as
 //! normal windows (and "Always on Top" is still in the Alt+Space menu).
+//!
+//! An invisible grip in the bottom-right corner resizes a readout; the size
+//! is remembered per readout.
 
 use crate::widgets::{Color, Graph, Key, Line, Scale};
 use crate::{app, format, settings};
 use adw::prelude::*;
-use gtk::{gdk, gio, glib};
+use gtk::{gdk, gio, glib, graphene};
 use plume_core::gpu::PowerState;
 use plume_core::Shared;
-use std::cell::RefCell;
+use std::cell::{Cell, RefCell};
 use std::collections::BTreeMap;
+use std::rc::Rc;
 
 /// Window-title prefix the shell extension matches on. Keep in sync with extension.js.
 pub const TITLE_PREFIX: &str = "Plume Float · ";
+
+/// Side of the invisible resize grip in the bottom-right corner, logical px.
+const GRIP_PX: i32 = 16;
 
 thread_local! {
     static OPEN: RefCell<BTreeMap<String, gtk::Window>> = RefCell::new(BTreeMap::new());
@@ -108,7 +115,7 @@ pub fn open(id: &str) {
     value.add_css_class("plume-float-value");
     value.set_halign(gtk::Align::End);
     value.set_xalign(1.0);
-    crate::widgets::card::fixed_width(&value, 16);
+    crate::widgets::card::fixed_width(&value, value_chars(id));
     title.set_ellipsize(gtk::pango::EllipsizeMode::End);
     title.set_width_chars(1);
     let header = gtk::Box::new(gtk::Orientation::Horizontal, 6);
@@ -116,6 +123,7 @@ pub fn open(id: &str) {
     header.append(&value);
 
     let mut graphs: Vec<Graph> = Vec::new();
+    let default_size: (i32, i32);
     let body: gtk::Widget = if id == "cores" {
         let grid = gtk::Grid::new();
         grid.set_row_spacing(3);
@@ -130,20 +138,20 @@ pub fn open(id: &str) {
         for i in 0..n_cores {
             let g = Graph::new(&[Line { key: Key::Core(i), color: Color::Core(i), fill: true }], Scale::Unit);
             g.set_grid(false);
-            g.set_size_request(60, 28);
+            g.set_size_request(24, 16);
             grid.attach(&g, (i % cols) as i32, (i / cols) as i32, 1, 1);
             graphs.push(g);
         }
-        win.set_default_size(300, 36 + 34 * n_cores.div_ceil(cols) as i32 + 10);
+        default_size = (300, 36 + 34 * n_cores.div_ceil(cols) as i32 + 10);
         grid.upcast()
     } else {
         let (lines, scale) = lines_for(id, gpu_idx);
         let g = Graph::new(&lines, scale);
-        g.set_size_request(120, 50);
+        g.set_size_request(80, 32);
         g.set_margin_start(6);
         g.set_margin_end(6);
         g.set_margin_bottom(6);
-        win.set_default_size(260, 124);
+        default_size = (260, 124);
         graphs.push(g.clone());
         g.upcast()
     };
@@ -157,13 +165,36 @@ pub fn open(id: &str) {
     }
     GRAPHS.with(|m| m.borrow_mut().insert(id.to_string(), graphs));
 
-    let overlay = gtk::Box::new(gtk::Orientation::Vertical, 0);
-    overlay.append(&header);
-    overlay.append(&body);
+    let size = settings::with(|s| s.float_sizes.get(id).copied()).unwrap_or(default_size);
+    win.set_default_size(size.0, size.1);
 
-    // Dragging anywhere moves the window (xdg_toplevel.move on Wayland).
+    let content = gtk::Box::new(gtk::Orientation::Vertical, 0);
+    content.append(&header);
+    content.append(&body);
+
+    // The bottom-right corner resizes. The compositor runs the resize
+    // (xdg_toplevel.resize on Wayland), so it is as smooth as any window's.
+    let grip = gtk::Box::new(gtk::Orientation::Horizontal, 0);
+    grip.set_size_request(GRIP_PX, GRIP_PX);
+    grip.set_halign(gtk::Align::End);
+    grip.set_valign(gtk::Align::End);
+    grip.set_cursor_from_name(Some("se-resize"));
+    let press = gtk::GestureClick::new();
+    press.set_button(gdk::BUTTON_PRIMARY);
+    press.connect_pressed(|g, _, x, y| begin_resize(g, x, y));
+    grip.add_controller(press);
+
+    let layers = gtk::Overlay::new();
+    layers.set_child(Some(&content));
+    layers.add_overlay(&grip);
+    // GtkWindow clips hit-testing to its rounded corners, which would leave
+    // the very corner, where people grab, dead. Nothing inside reaches the
+    // corners (everything has margins), so this changes no pixels.
+    win.set_overflow(gtk::Overflow::Visible);
+
+    // Dragging anywhere else moves the window (xdg_toplevel.move on Wayland).
     let handle = gtk::WindowHandle::new();
-    handle.set_child(Some(&overlay));
+    handle.set_child(Some(&layers));
     win.set_child(Some(&handle));
 
     // Right-click menu.
@@ -187,28 +218,37 @@ pub fn open(id: &str) {
     close_item.set_action_and_target_value(Some("app.float"), Some(&id.to_variant()));
     menu.append_item(&close_item);
     let pop = gtk::PopoverMenu::from_model(Some(&menu));
-    pop.set_parent(&overlay);
+    pop.set_parent(&content);
     pop.set_has_arrow(false);
+    // On the overlay, so the grip's corner gets the menu too (and never the
+    // window manager's menu, which GtkWindowHandle would show).
     let click = gtk::GestureClick::new();
     click.set_button(gdk::BUTTON_SECONDARY);
     click.connect_pressed(glib::clone!(
         #[weak]
         pop,
+        #[weak]
+        content,
         move |g, _, x, y| {
+            let at = g.widget().and_then(|w| w.compute_point(&content, &graphene::Point::new(x as f32, y as f32)));
+            let (x, y) = at.map_or((x, y), |p| (p.x() as f64, p.y() as f64));
             pop.set_pointing_to(Some(&gdk::Rectangle::new(x as i32, y as i32, 1, 1)));
             pop.popup();
             g.set_state(gtk::EventSequenceState::Claimed);
         }
     ));
-    overlay.add_controller(click);
+    layers.add_controller(click);
     let dbl = gtk::GestureClick::new();
     dbl.set_button(gdk::BUTTON_PRIMARY);
-    dbl.connect_pressed(|_, n, _, _| {
+    dbl.connect_pressed(|g, n, _, _| {
         if n == 2 {
+            // Claimed, or GtkWindowHandle would also take the double-click
+            // and maximize the readout.
+            g.set_state(gtk::EventSequenceState::Claimed);
             app::show_main();
         }
     });
-    overlay.add_controller(dbl);
+    layers.add_controller(dbl);
     let keys = gtk::EventControllerKey::new();
     keys.connect_key_pressed(glib::clone!(
         #[weak]
@@ -254,7 +294,73 @@ pub fn open(id: &str) {
             }
         });
     }
-    win.connect_close_request(move |_| {
+    // Remember a size the user sets. Debounced: a resize reports a new size
+    // every frame, and each save rewrites the settings file.
+    let pending: Rc<RefCell<Option<glib::SourceId>>> = Rc::default();
+    let save_size: Rc<dyn Fn(&gtk::Window)> = {
+        let id = id.to_string();
+        Rc::new(move |w: &gtk::Window| {
+            let (wd, ht) = w.default_size();
+            if wd <= 0 || ht <= 0 || w.is_maximized() || w.is_fullscreen() {
+                return;
+            }
+            let new = ((wd, ht) != default_size).then_some((wd, ht));
+            if settings::with(|s| s.float_sizes.get(&id).copied()) != new {
+                settings::update(|s| match new {
+                    Some(v) => {
+                        s.float_sizes.insert(id.clone(), v);
+                    }
+                    None => {
+                        s.float_sizes.remove(&id);
+                    }
+                });
+            }
+        })
+    };
+    // Too narrow for the title beside the value: drop the title rather than
+    // show a lone "…". The value is what matters in a small readout.
+    let fit_title = {
+        let (title, value) = (title.clone(), value.clone());
+        let title_w = Cell::new(0);
+        move |w: &gtk::Window| {
+            if title.is_visible() {
+                title_w.set(title.measure(gtk::Orientation::Horizontal, -1).1);
+            }
+            let need = title_w.get() + 6 + value.measure(gtk::Orientation::Horizontal, -1).1;
+            let fits = w.default_size().0 >= need;
+            title.set_visible(fits);
+            value.set_hexpand(!fits); // keeps the value at the right edge alone
+        }
+    };
+    fit_title(&win);
+    let on_size: Rc<dyn Fn(&gtk::Window)> = {
+        let (pending, save_size) = (pending.clone(), save_size.clone());
+        Rc::new(move |w: &gtk::Window| {
+            fit_title(w);
+            if let Some(src) = pending.take() {
+                src.remove();
+            }
+            let (later, save_size, weak) = (pending.clone(), save_size.clone(), w.downgrade());
+            let src = glib::timeout_add_local_once(std::time::Duration::from_millis(500), move || {
+                later.take(); // this source is done; forget its id
+                if let Some(w) = weak.upgrade() {
+                    save_size(&w);
+                }
+            });
+            pending.replace(Some(src));
+        })
+    };
+    {
+        let f = on_size.clone();
+        win.connect_default_width_notify(move |w| f(w));
+    }
+    win.connect_default_height_notify(move |w| on_size(w));
+
+    win.connect_close_request(move |w| {
+        if let Some(src) = pending.take() {
+            src.remove();
+            save_size(w);
+        }
         OPEN.with(|o| o.borrow_mut().remove(&id_s));
         GRAPHS.with(|g| g.borrow_mut().remove(&id_s));
         remember();
@@ -269,6 +375,35 @@ pub fn open(id: &str) {
     win.present();
     app::update_demand();
     app::maybe_hint_extension();
+}
+
+/// Header value width in characters: room for the longest value, so the text
+/// never resizes anything.
+fn value_chars(id: &str) -> i32 {
+    match id {
+        "mem" | "net" | "disk" => 16, // "45 % · 15.6 GiB", "↓1023K ↑1023K"
+        _ => 7,                       // "100 %", "Asleep"
+    }
+}
+
+/// Starts a compositor-driven resize from the bottom-right corner.
+fn begin_resize(g: &gtk::GestureClick, x: f64, y: f64) {
+    let Some(w) = g.widget() else { return };
+    let Some(native) = w.native() else { return };
+    let Some(top) = native.surface().and_downcast::<gdk::Toplevel>() else { return };
+    let Some(p) = w.compute_point(&native, &graphene::Point::new(x as f32, y as f32)) else { return };
+    let (sx, sy) = native.surface_transform();
+    g.set_state(gtk::EventSequenceState::Claimed);
+    top.begin_resize(
+        gdk::SurfaceEdge::SouthEast,
+        g.current_event_device().as_ref(),
+        g.current_button() as i32,
+        p.x() as f64 + sx,
+        p.y() as f64 + sy,
+        g.current_event_time(),
+    );
+    // The compositor owns the pointer until the button is released.
+    g.reset();
 }
 
 fn remember() {

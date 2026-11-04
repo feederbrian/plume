@@ -1,5 +1,15 @@
 # Changelog
 
+## 0.2.1 — 2026-11-04
+
+### Floating readouts
+- **Resize** a readout by dragging its bottom-right corner. The grip is invisible; the pointer turns into a resize arrow over it. The compositor runs the resize, and each readout remembers its size.
+- Readouts can be much smaller than before (about 120 × 64 px for CPU and GPU). When the title no longer fits beside the value, the title is hidden rather than shown as "…".
+- Double-clicking a readout no longer also asks the window manager to maximize it; it only opens the main window, as intended.
+
+### Overview
+- **Reorder cards** by dragging a card's header (the pointer shows an open hand). Nothing moves while you drag. The card dims, an outline marks the slot it will take, and the cards rearrange once you let go. Near the top or bottom edge, the page scrolls. The order is remembered, and a newly detected GPU card appears after its neighbour in the default order.
+
 ## 0.2.0 — 2026-11-04
 
 Smoothness and efficiency, from a profiling pass on real-hardware feedback

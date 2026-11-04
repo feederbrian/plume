@@ -24,7 +24,8 @@
 - **Per-process tabs, like Activity Monitor.** CPU, Memory, Disk and Network each show the process list with the columns that matter for that resource, plus a live summary panel. Search, filter and selection carry across tabs.
 - **Smooth, sharp, live graphs.** A tiny GPU shader draws every graph each frame from a few hundred bytes of new data per sample, so lines are exactly as thin as you set them and glide at 60 fps without stutter.
 - **Any time scale.** From 30 seconds to 1 hour, set in the header bar, with Ctrl+scroll over any graph, or separately for each floating readout.
-- **Floating readouts.** Pop any graph out into a small always-on-top window, macOS-style.
+- **Floating readouts.** Pop any graph out into a small always-on-top window, macOS-style. Resize it from its bottom-right corner.
+- **An Overview you arrange.** CPU, memory, every GPU, network and disks on one page. Drag a card by its header to put it where you want it.
 - **Laptop-friendly GPU monitoring.** Intel, NVIDIA and AMD, with real engine utilisation and a per-process **% GPU** column. A sleeping discrete GPU is never woken up just to be measured.
 - **Process control.** End, kill, stop, continue and re-prioritise, with protection against acting on a recycled PID, and an administrator prompt for other users' processes.
 - **An inspector for every process.** Command line, executable, working directory, systemd unit, memory breakdown, I/O, network, open files, context switches.
@@ -61,7 +62,7 @@
 Download the latest `.deb` from [**Releases**](https://github.com/feederbrian/plume/releases/latest), then:
 
 ```bash
-sudo apt install ./plume_0.2.0_amd64.deb
+sudo apt install ./plume_0.2.1_amd64.deb
 ```
 
 Plume appears in your applications as **Plume**. It needs Ubuntu 24.04 or newer (GTK ≥ 4.14, libadwaita ≥ 1.5) and runs on X11 or Wayland.
@@ -70,7 +71,7 @@ Plume appears in your applications as **Plume**. It needs Ubuntu 24.04 or newer 
 
 <img src="docs/screenshots/floats.png" alt="Three floating readouts: CPU, network and memory">
 
-Click the pop-out button on any graph, or use the window button in the header bar. Drag a readout anywhere. Right-click it for opacity, time scale or closing; scroll over it to change its time scale; double-click to open the main window; press Esc to close it.
+Click the pop-out button on any graph, or use the window button in the header bar. Drag a readout anywhere, and drag its bottom-right corner to resize it; each readout remembers its size. Right-click it for opacity, time scale or closing; scroll over it to change its time scale; double-click to open the main window; press Esc to close it.
 
 On GNOME's Wayland session, apps can't keep their own windows above others. That's a deliberate compositor policy. The bundled **Plume Floats** shell extension does it for Plume's readouts only, puts them on every workspace and remembers where you left them. Enable it once, after logging out and back in following installation:
 
@@ -98,6 +99,8 @@ IDs: `cpu`, `cores`, `mem`, `gpu0`, `gpu1`, `net`, `disk`. Running `plume` again
 | <kbd>Ctrl</kbd>+<kbd>S</kbd> / <kbd>Ctrl</kbd>+<kbd>C</kbd> | Stop / continue the selected process |
 | <kbd>Enter</kbd>, double-click, <kbd>Ctrl</kbd>+<kbd>I</kbd> | Open the process inspector |
 | Right-click a process | Actions and priority |
+| Drag a card's header (Overview) | Reorder the cards |
+| Drag a readout's bottom-right corner | Resize the readout |
 | <kbd>Ctrl</kbd>+scroll on a graph, <kbd>Ctrl</kbd>+<kbd>−</kbd> / <kbd>Ctrl</kbd>+<kbd>=</kbd> | Longer / shorter time scale |
 | <kbd>Ctrl</kbd>+<kbd>,</kbd> | Preferences: theme, line width, frame rates, sampling, time scale |
 
@@ -138,7 +141,7 @@ cargo test --release
 ./packaging/build-deb.sh
 ```
 
-`cargo run` starts Plume, `cargo test` runs the 36 tests (including a live TCP attribution test), and the packaging script builds `plume_<version>_amd64.deb`. [docs/DESIGN.md](docs/DESIGN.md) covers the architecture, the performance decisions and the measurements.
+`cargo run` starts Plume, `cargo test` runs the 37 tests (including a live TCP attribution test), and the packaging script builds `plume_<version>_amd64.deb`. [docs/DESIGN.md](docs/DESIGN.md) covers the architecture, the performance decisions and the measurements.
 
 ## License
 

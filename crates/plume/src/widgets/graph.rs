@@ -372,8 +372,9 @@ mod imp {
 
         fn measure(&self, orientation: gtk::Orientation, _for_size: i32) -> (i32, i32, i32, i32) {
             match orientation {
-                gtk::Orientation::Horizontal => (40, 80, -1, -1),
-                _ => (36, 120, -1, -1),
+                // A small minimum lets floating readouts shrink; callers set real sizes.
+                gtk::Orientation::Horizontal => (24, 80, -1, -1),
+                _ => (16, 120, -1, -1),
             }
         }
 
