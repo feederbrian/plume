@@ -87,6 +87,8 @@ second, all landing in the same frame, and they could stall the UI thread.
    costs several MB. With a shared context the GL viewport is shared state, so
    each draw sets its own from the area's tracked framebuffer size.
 
+![Graph lines in 0.1 (3 device px, snapped scrolling) and 0.2 (1.5 px, exact)](screenshots/lines.png)
+
 GL entry points come from libepoxy's dispatch pointers (GTK already loads it),
 so there's no extra dependency, and the same shader body compiles as GLSL 3.30
 core or GLSL ES 3.00. Without OpenGL, the old GskPath-to-texture renderer is
