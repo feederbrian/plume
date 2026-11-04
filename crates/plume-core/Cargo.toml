@@ -1,0 +1,11 @@
+[package]
+name = "plume-core"
+description = "Low-overhead Linux system metrics collector for Plume"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+
+[dependencies]
+libc = "0.2"
+
+[dev-dependencies]

@@ -1,0 +1,8 @@
+{
+  "uuid": "plume-floats@feederbrian.github.io",
+  "name": "Plume Floats",
+  "description": "Keeps Plume's floating readouts (CPU, GPU, memory, network, disk) above other windows on every workspace, and remembers where you put them. Wayland does not let applications do this themselves.",
+  "shell-version": ["45", "46", "47", "48", "49", "50", "51"],
+  "url": "https://github.com/feederbrian/plume",
+  "version-name": "0.1.0"
+}

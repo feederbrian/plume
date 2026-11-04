@@ -1,0 +1,44 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<component type="desktop-application">
+  <id>io.github.feederbrian.Plume</id>
+  <metadata_license>CC0-1.0</metadata_license>
+  <project_license>GPL-3.0-or-later</project_license>
+  <name>Plume</name>
+  <summary>Featherweight system monitor with live graphs</summary>
+  <description>
+    <p>Plume shows what your computer is doing, per process and system-wide, with smoothly animated graphs that cost almost nothing to draw.</p>
+    <ul>
+      <li>CPU, Memory, Disk and Network tabs with per-process columns and live summaries</li>
+      <li>Intel, NVIDIA and AMD GPU monitoring that never wakes a sleeping laptop GPU</li>
+      <li>Floating readouts that stay on top (with the Plume Floats shell extension)</li>
+      <li>Time scales from 30 seconds to one hour, globally or per floating readout</li>
+      <li>End, kill, stop, continue and re-prioritise processes, with PID-reuse protection</li>
+      <li>Light, dark, Tokyo Night, Solarized, Nord, Gruvbox, Dracula, Catppuccin and more</li>
+    </ul>
+  </description>
+  <developer id="io.github.feederbrian">
+    <name>Brian Soria</name>
+  </developer>
+  <url type="homepage">https://github.com/feederbrian/plume</url>
+  <url type="bugtracker">https://github.com/feederbrian/plume/issues</url>
+  <url type="vcs-browser">https://github.com/feederbrian/plume</url>
+  <launchable type="desktop-id">io.github.feederbrian.Plume.desktop</launchable>
+  <screenshots>
+    <screenshot type="default">
+      <caption>Overview dashboard with floating readouts</caption>
+      <image>https://raw.githubusercontent.com/feederbrian/plume/main/docs/screenshots/hero.png</image>
+    </screenshot>
+    <screenshot>
+      <caption>CPU tab with per-process usage and live CPU load</caption>
+      <image>https://raw.githubusercontent.com/feederbrian/plume/main/docs/screenshots/cpu.png</image>
+    </screenshot>
+    <screenshot>
+      <caption>Network tab with per-process traffic</caption>
+      <image>https://raw.githubusercontent.com/feederbrian/plume/main/docs/screenshots/network.png</image>
+    </screenshot>
+  </screenshots>
+  <content_rating type="oars-1.1"/>
+  <releases>
+    <release version="0.1.0" date="2026-11-04"/>
+  </releases>
+</component>

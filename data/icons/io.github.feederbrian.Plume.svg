@@ -1,0 +1,21 @@
+<svg xmlns="http://www.w3.org/2000/svg" width="128" height="128" viewBox="0 0 128 128">
+  <defs>
+    <linearGradient id="bg" x1="0" y1="0" x2="0" y2="1">
+      <stop offset="0" stop-color="#3a3f5c"/>
+      <stop offset="1" stop-color="#1a1b26"/>
+    </linearGradient>
+    <linearGradient id="fill" x1="0" y1="0" x2="0" y2="1">
+      <stop offset="0" stop-color="#7aa2f7" stop-opacity="0.55"/>
+      <stop offset="1" stop-color="#7aa2f7" stop-opacity="0.05"/>
+    </linearGradient>
+  </defs>
+  <rect x="8" y="12" width="112" height="104" rx="22" fill="url(#bg)"/>
+  <g stroke="#ffffff" stroke-opacity="0.08" stroke-width="2">
+    <line x1="18" y1="42" x2="110" y2="42"/><line x1="18" y1="64" x2="110" y2="64"/><line x1="18" y1="86" x2="110" y2="86"/>
+  </g>
+  <path d="M18 92 C30 92 30 70 42 70 C52 70 52 82 62 82 C74 82 72 40 86 40 C98 40 98 60 110 56 L110 104 L18 104 Z" fill="url(#fill)"/>
+  <path d="M18 92 C30 92 30 70 42 70 C52 70 52 82 62 82 C74 82 72 40 86 40 C98 40 98 60 110 56" fill="none" stroke="#7aa2f7" stroke-width="5" stroke-linecap="round" stroke-linejoin="round"/>
+  <!-- feather -->
+  <path d="M96 20 C78 24 66 40 64 58 C74 54 88 46 96 20 Z" fill="#c0caf5"/>
+  <path d="M95 22 L66 56" stroke="#1a1b26" stroke-width="2" stroke-linecap="round"/>
+</svg>

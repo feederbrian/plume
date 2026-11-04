@@ -1,0 +1,21 @@
+[Desktop Entry]
+Name=Plume
+GenericName=System Monitor
+Comment=Featherweight system monitor with live 60 fps graphs
+Exec=plume
+Icon=io.github.feederbrian.Plume
+Terminal=false
+Type=Application
+Categories=GTK;GNOME;System;Monitor;
+Keywords=process;task;manager;cpu;gpu;memory;network;disk;monitor;activity;kill;
+StartupNotify=true
+DBusActivatable=false
+Actions=float-cpu;float-gpu;
+
+[Desktop Action float-cpu]
+Name=Floating CPU Readout
+Exec=plume --background --float cpu
+
+[Desktop Action float-gpu]
+Name=Floating GPU Readouts
+Exec=plume --background --float gpu0 --float gpu1
