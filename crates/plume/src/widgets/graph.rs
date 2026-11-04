@@ -1,22 +1,27 @@
 //! Live, smoothly scrolling history graph.
 //!
-//! Drawing cost is the reason this widget exists. A naive approach rebuilds
-//! and rasterises the curve every frame (which is what made GNOME System
-//! Monitor's "smooth" graphs expensive). Instead:
+//! **GL path (default).** The widget hosts a `GtkGLArea`. History is reduced to
+//! one value per device-pixel column (see `columns.rs`) and kept in a small
+//! RGBA32F ring texture. Each frame the shader in `gl.rs` draws grid, fills and
+//! lines in a single pass from that texture, positioned by one "scroll"
+//! uniform. Consequences:
 //!
-//! 1. When a **new sample** arrives (~10 Hz), the curve is built once as a
-//!    GskPath and rendered **on the GPU into a texture** that is slightly wider
-//!    than the widget.
-//! 2. Every **frame** (60 Hz), the widget only emits a clip, a handful of grid
-//!    rectangles and that texture shifted left by a sub-pixel offset. That is a
-//!    GPU blit, so the CPU cost per frame is close to zero.
-//! 3. The display runs one sample interval behind real time, so there is
-//!    always real data at the right edge and the scroll never stutters.
+//! * per sample (10 Hz): a few dozen columns are recomputed and uploaded
+//!   (a few hundred bytes); nothing is rasterised on the CPU, nothing blocks;
+//! * per frame: a handful of uniforms and one draw call;
+//! * lines are exactly `line_px` device pixels wide at any sub-pixel scroll
+//!   position, so motion is perfectly even and edges stay crisp;
+//! * the auto-scaled y axis eases every frame instead of jumping per sample.
 //!
-//! The tick callback is installed only while the widget is mapped, and GTK
-//! stops ticking for hidden, minimised or suspended windows, so an invisible
-//! graph costs nothing.
+//! **Fallback path.** Without OpenGL the curve is built as a GskPath per
+//! sample, rendered into a texture and slid into place each frame.
+//!
+//! Either way the tick callback exists only while the graph is mapped, frames
+//! are skipped when nothing moved, and unfocused windows (floating readouts,
+//! background windows) run at a lower frame rate.
 
+use super::columns::Columns;
+use super::gl;
 use crate::theme;
 use gtk::{gdk, glib, graphene, gsk, prelude::*, subclass::prelude::*};
 use plume_core::history::Series;
@@ -104,67 +109,50 @@ pub enum Scale {
     Auto { floor: f32 },
 }
 
-// Frame-rate cap shared by all graphs (µs between frames; 0 = uncapped).
+// Settings shared by all graphs.
 thread_local! {
-    static MIN_FRAME_US: Cell<i64> = const { Cell::new(16_000) };
+    /// Minimum µs between frames: focused window / everything else (0 = uncapped).
+    static MIN_FRAME_FG: Cell<i64> = const { Cell::new(15_000) };
+    static MIN_FRAME_BG: Cell<i64> = const { Cell::new(31_000) };
     static HISTORY_US: Cell<i64> = const { Cell::new(60_000_000) };
-    static SMOOTH: Cell<bool> = const { Cell::new(true) };
+    static SMOOTH: Cell<bool> = const { Cell::new(false) };
+    /// Line width in *device* pixels.
+    static LINE_PX: Cell<f32> = const { Cell::new(1.5) };
+    /// Bumped when any of the above changes, so graphs re-render.
+    static CFG_GEN: Cell<u64> = const { Cell::new(1) };
 }
 
-// Optional self-profiling (PLUME_PROFILE=1): time spent in our own graph code,
-// separate from GTK's rendering, printed every 5 s.
-thread_local! {
-    static PROF: Cell<Option<(i64, u64, i64, u64, i64, u64, i64)>> = const { Cell::new(None) };
+fn bump() {
+    CFG_GEN.with(|g| g.set(g.get() + 1));
 }
 
-fn prof_enabled() -> bool {
-    thread_local! { static ON: bool = std::env::var_os("PLUME_PROFILE").is_some(); }
-    ON.with(|o| *o)
+fn cap_us(fps: u32) -> i64 {
+    if fps == 0 { 0 } else { 1_000_000 / fps as i64 - 1_500 }
 }
 
-/// (ticks, tick_us, rebuilds, rebuild_us, snapshots, snapshot_us)
-fn prof_add(tick_us: i64, rebuild_us: Option<i64>, snapshot_us: Option<i64>) {
-    PROF.with(|p| {
-        let now = glib::monotonic_time();
-        let (start, ticks, tus, rebuilds, rus, snaps, sus) = p.get().unwrap_or((now, 0, 0, 0, 0, 0, 0));
-        let mut v = (start, ticks, tus, rebuilds, rus, snaps, sus);
-        if tick_us >= 0 {
-            v.1 += 1;
-            v.2 += tick_us;
-        }
-        if let Some(r) = rebuild_us {
-            v.3 += 1;
-            v.4 += r;
-        }
-        if let Some(sn) = snapshot_us {
-            v.5 += 1;
-            v.6 += sn;
-        }
-        let elapsed = now - start;
-        if elapsed >= 5_000_000 {
-            let secs = elapsed as f64 / 1e6;
-            let own = (v.2 + v.4 + v.6) as f64 / elapsed as f64 * 100.0;
-            eprintln!(
-                "plume-profile: {:.0} graph ticks/s ({:.1} µs avg), {:.1} rebuilds/s ({:.0} µs avg), {:.0} snapshots/s ({:.1} µs avg) → graph code = {:.2} % of one core",
-                v.1 as f64 / secs,
-                v.2 as f64 / v.1.max(1) as f64,
-                v.3 as f64 / secs,
-                v.4 as f64 / v.3.max(1) as f64,
-                v.5 as f64 / secs,
-                v.6 as f64 / v.5.max(1) as f64,
-                own
-            );
-            v = (now, 0, 0, 0, 0, 0, 0);
-        }
-        p.set(Some(v));
-    });
-}
-
-pub fn set_fps_cap(fps: u32) {
-    MIN_FRAME_US.with(|c| c.set(if fps == 0 { 0 } else { 1_000_000 / fps as i64 - 1500 }));
+/// Frame-rate caps: for the focused window, and for unfocused windows and
+/// floating readouts (which are almost always unfocused).
+pub fn set_fps_caps(focused: u32, background: u32) {
+    MIN_FRAME_FG.with(|c| c.set(cap_us(focused)));
+    MIN_FRAME_BG.with(|c| c.set(cap_us(background)));
+    bump();
 }
 pub fn set_history_secs(s: u32) {
     HISTORY_US.with(|c| c.set(s as i64 * 1_000_000));
+    bump();
+}
+pub fn set_smooth(on: bool) {
+    SMOOTH.with(|c| c.set(on));
+    bump();
+}
+pub fn set_line_px(px: f32) {
+    LINE_PX.with(|c| c.set(px.clamp(0.5, 6.0)));
+    bump();
+}
+
+/// Which graph renderer is in use (for the About dialog's debug info).
+pub fn renderer_name() -> &'static str {
+    RENDERER.with(Cell::get)
 }
 
 /// Selectable time scales, in seconds.
@@ -190,8 +178,102 @@ fn grid_step_us(window: i64) -> i64 {
     let target = window / 6;
     STEPS.iter().map(|s| s * 1_000_000).find(|&s| s >= target).unwrap_or(600_000_000)
 }
-pub fn set_smooth(on: bool) {
-    SMOOTH.with(|c| c.set(on));
+
+// ---------------------------------------------------------------------------
+// Self-profiling (PLUME_PROFILE=1): time spent in our own graph code.
+// ---------------------------------------------------------------------------
+
+#[derive(Clone, Copy, Default)]
+struct Prof {
+    start: i64,
+    ticks: u64,
+    tick_us: i64,
+    builds: u64,
+    build_us: i64,
+    draws: u64,
+    draw_us: i64,
+    upload_bytes: u64,
+    /// Size changes of an already-visible graph (layout instability).
+    resizes: u64,
+}
+
+thread_local! {
+    static PROF: Cell<Prof> = Cell::new(Prof::default());
+}
+
+fn prof_add(f: impl FnOnce(&mut Prof)) {
+    if !crate::profile::enabled() {
+        return;
+    }
+    PROF.with(|p| {
+        let now = glib::monotonic_time();
+        let mut v = p.get();
+        if v.start == 0 {
+            v.start = now;
+        }
+        f(&mut v);
+        let el = now - v.start;
+        if el >= 5_000_000 {
+            let s = el as f64 / 1e6;
+            eprintln!(
+                "plume-profile: {:.0} ticks/s ({:.1} µs), {:.1} data updates/s ({:.0} µs), {:.0} draws/s ({:.1} µs), \
+                 {:.1} KiB/s uploaded, {} graph resizes → graph code = {:.2} % of one core",
+                v.ticks as f64 / s,
+                v.tick_us as f64 / v.ticks.max(1) as f64,
+                v.builds as f64 / s,
+                v.build_us as f64 / v.builds.max(1) as f64,
+                v.draws as f64 / s,
+                v.draw_us as f64 / v.draws.max(1) as f64,
+                v.upload_bytes as f64 / 1024.0 / s,
+                v.resizes,
+                (v.tick_us + v.build_us + v.draw_us) as f64 / el as f64 * 100.0
+            );
+            v = Prof { start: now, ..Default::default() };
+        }
+        p.set(v);
+    });
+}
+
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+enum Backend {
+    #[default]
+    Pending,
+    Gl,
+    Gsk,
+}
+
+#[derive(Default)]
+struct GlRes {
+    prog: Option<gl::Program>,
+    tex: u32,
+    vao: u32,
+    tex_alloc: usize,
+}
+
+thread_local! {
+    /// Programs are shared objects, so one link serves every GL area.
+    static SHARED_PROG: Cell<Option<gl::Program>> = const { Cell::new(None) };
+    static GL_WARNED: Cell<bool> = const { Cell::new(false) };
+    static RENDERER: Cell<&'static str> = const { Cell::new("not started") };
+    /// One GL context per window, shared by all of its graphs (each graph still
+    /// renders into its own framebuffer). A context per GLArea costs several MB.
+    static WINDOW_CTX: RefCell<Vec<(glib::WeakRef<gdk::Surface>, gdk::GLContext)>> = const { RefCell::new(Vec::new()) };
+}
+
+fn shared_context(area: &gtk::GLArea) -> Option<gdk::GLContext> {
+    let surface = area.native()?.surface()?;
+    WINDOW_CTX.with(|c| {
+        let mut v = c.borrow_mut();
+        v.retain(|(w, _)| w.upgrade().is_some());
+        if let Some((_, ctx)) = v.iter().find(|(w, _)| w.upgrade().as_ref() == Some(&surface)) {
+            return Some(ctx.clone());
+        }
+        let ctx = surface.create_gl_context().ok()?;
+        ctx.set_allowed_apis(area.allowed_apis());
+        ctx.realize().ok()?;
+        v.push((surface.downgrade(), ctx.clone()));
+        Some(ctx)
+    })
 }
 
 mod imp {
@@ -203,24 +285,42 @@ mod imp {
         pub scale: Cell<Option<Scale>>,
         pub grid: Cell<bool>,
         pub tick: RefCell<Option<gtk::TickCallbackId>>,
-        pub tex: RefCell<Option<gdk::Texture>>,
-        pub built_gens: RefCell<Vec<u64>>,
-        pub built_disp: Cell<i64>,
-        pub built_size: Cell<(i32, i32)>,
-        pub built_scale: Cell<f64>,
-        pub built_theme: Cell<u64>,
-        pub built_window: Cell<i64>,
-        pub tex_w: Cell<f32>,
-        pub ymax: Cell<f32>,
-        pub delay: Cell<i64>,
-        pub disp: Cell<i64>,
-        pub last_frame: Cell<i64>,
-        pub pts: RefCell<Vec<Vec<(i64, f32)>>>,
         pub on_ymax: RefCell<Option<Box<dyn Fn(f32)>>>,
         /// Per-graph time scale (floats); None = follow the global setting.
         pub window_override: Cell<Option<i64>>,
-        pub last_rebuild: Cell<i64>,
-        pub last_off_px: Cell<i64>,
+        pub delay: Cell<i64>,
+        pub disp: Cell<i64>,
+        pub last_frame: Cell<i64>,
+        pub ymax: Cell<f32>,
+        pub ymax_target: Cell<f32>,
+        pub gens: RefCell<Vec<u64>>,
+        pub last_size: Cell<(i32, i32)>,
+        pub pts: RefCell<Vec<Vec<(i64, f32)>>>,
+        backend: Cell<Backend>,
+
+        // ---- GL path ----
+        pub area: RefCell<Option<gtk::GLArea>>,
+        cols: RefCell<Columns>,
+        res: RefCell<GlRes>,
+        /// Absolute column coordinate of the right edge for this frame.
+        u0: Cell<f64>,
+        last_u0: Cell<f64>,
+        last_render: Cell<i64>,
+        rendered_cfg: Cell<(u64, u64)>,
+        fbo: Cell<(i32, i32)>,
+        dev_scale: Cell<f64>,
+
+        // ---- fallback (GSK texture) path ----
+        tex: RefCell<Option<gdk::Texture>>,
+        built_disp: Cell<i64>,
+        built_size: Cell<(i32, i32)>,
+        built_scale: Cell<f64>,
+        built_theme: Cell<u64>,
+        built_window: Cell<i64>,
+        built_cfg: Cell<u64>,
+        tex_w: Cell<f32>,
+        last_rebuild: Cell<i64>,
+        last_off_px: Cell<i64>,
     }
 
     #[glib::object_subclass]
@@ -228,6 +328,10 @@ mod imp {
         const NAME: &'static str = "PlumeGraph";
         type Type = super::Graph;
         type ParentType = gtk::Widget;
+
+        fn class_init(klass: &mut Self::Class) {
+            klass.set_accessible_role(gtk::AccessibleRole::Img);
+        }
     }
 
     impl ObjectImpl for Graph {
@@ -235,8 +339,15 @@ mod imp {
             self.parent_constructed();
             self.grid.set(true);
             self.ymax.set(1.0);
+            self.ymax_target.set(1.0);
             self.obj().add_css_class("plume-graph");
             self.obj().set_overflow(gtk::Overflow::Hidden);
+        }
+
+        fn dispose(&self) {
+            if let Some(a) = self.area.take() {
+                a.unparent();
+            }
         }
     }
 
@@ -254,9 +365,8 @@ mod imp {
             if let Some(id) = self.tick.take() {
                 id.remove();
             }
-            // Drop the GPU texture while hidden.
             self.tex.replace(None);
-            self.built_gens.borrow_mut().clear();
+            self.gens.borrow_mut().clear();
             self.parent_unmap();
         }
 
@@ -267,29 +377,520 @@ mod imp {
             }
         }
 
+        fn size_allocate(&self, width: i32, height: i32, baseline: i32) {
+            if let Some(a) = self.area.borrow().as_ref() {
+                a.allocate(width, height, baseline, None);
+            }
+        }
+
         fn snapshot(&self, snapshot: &gtk::Snapshot) {
-            let t0 = if prof_enabled() { glib::monotonic_time() } else { 0 };
-            self.draw(snapshot);
-            if prof_enabled() {
-                prof_add(-1, None, Some(glib::monotonic_time() - t0));
+            match self.backend.get() {
+                Backend::Gsk => {
+                    let t0 = glib::monotonic_time();
+                    self.gsk_draw(snapshot);
+                    prof_add(|p| {
+                        p.draws += 1;
+                        p.draw_us += glib::monotonic_time() - t0;
+                    });
+                }
+                _ => {
+                    if let Some(a) = self.area.borrow().as_ref() {
+                        self.obj().snapshot_child(a, snapshot);
+                    }
+                }
             }
         }
     }
 
     impl Graph {
-        fn draw(&self, snapshot: &gtk::Snapshot) {
+        pub(super) fn window_us(&self) -> i64 {
+            self.window_override.get().unwrap_or_else(|| HISTORY_US.with(Cell::get))
+        }
+
+        // ------------------------------------------------------------------
+        // Backend selection
+        // ------------------------------------------------------------------
+
+        pub(super) fn setup_gl(&self) {
+            let area = gtk::GLArea::new();
+            area.set_auto_render(false);
+            area.set_has_depth_buffer(false);
+            area.set_has_stencil_buffer(false);
+            area.set_can_target(false);
+            // PLUME_GL_API=gles|gl restricts the API (for testing both shader variants).
+            match std::env::var("PLUME_GL_API").as_deref() {
+                Ok("gles") => area.set_allowed_apis(gdk::GLAPI::GLES),
+                Ok("gl") => area.set_allowed_apis(gdk::GLAPI::GL),
+                _ => {}
+            }
+            area.set_parent(&*self.obj());
+            area.connect_create_context(|a| {
+                let ctx = shared_context(a);
+                if ctx.is_none() {
+                    a.set_error(Some(&glib::Error::new(gdk::GLError::NotAvailable, "no GL context")));
+                }
+                ctx
+            });
+            let weak = self.obj().downgrade();
+            area.connect_realize(glib::clone!(
+                #[strong]
+                weak,
+                move |a| {
+                    if let Some(g) = weak.upgrade() {
+                        g.imp().gl_realize(a);
+                    }
+                }
+            ));
+            area.connect_unrealize(glib::clone!(
+                #[strong]
+                weak,
+                move |a| {
+                    if let Some(g) = weak.upgrade() {
+                        g.imp().gl_unrealize(a);
+                    }
+                }
+            ));
+            // Framebuffer size in device pixels. Tracked per area because with a
+            // shared context the GL viewport is shared state (GTK only sets it
+            // when an area is resized), so each render must set its own.
+            area.connect_resize(glib::clone!(
+                #[strong]
+                weak,
+                move |_, w, h| {
+                    if let Some(g) = weak.upgrade() {
+                        g.imp().fbo.set((w, h));
+                    }
+                }
+            ));
+            area.connect_render(move |a, _ctx| {
+                if let Some(g) = weak.upgrade() {
+                    g.imp().gl_render(a);
+                }
+                glib::Propagation::Stop
+            });
+            self.area.replace(Some(area));
+        }
+
+        pub(super) fn use_gsk(&self) {
+            self.backend.set(Backend::Gsk);
+            if let Some(a) = self.area.take() {
+                a.unparent();
+            }
+            self.obj().queue_draw();
+        }
+
+        fn fallback(&self, why: &str) {
+            RENDERER.with(|r| r.set("fallback (GskPath textures)"));
+            if !GL_WARNED.with(|w| w.replace(true)) {
+                eprintln!("plume: OpenGL graphs unavailable ({why}); using the fallback renderer");
+            }
+            // Can't unparent from inside the GLArea's own realize handler.
+            let weak = self.obj().downgrade();
+            glib::idle_add_local_once(move || {
+                if let Some(g) = weak.upgrade() {
+                    g.imp().use_gsk();
+                }
+            });
+            self.backend.set(Backend::Gsk);
+        }
+
+        fn gl_realize(&self, a: &gtk::GLArea) {
+            a.make_current();
+            if let Some(e) = a.error() {
+                return self.fallback(e.message());
+            }
+            let Some(g) = gl::api() else { return self.fallback("libepoxy not found") };
+            let gles = a.api() == gdk::GLAPI::GLES;
+            RENDERER.with(|r| r.set(if gles { "OpenGL ES (shader)" } else { "OpenGL (shader)" }));
+            // Reuse the shared program if it is valid in this context's share group.
+            let prog = match SHARED_PROG.with(Cell::get) {
+                Some(p) if unsafe { (g.is_program())(p.id) } != 0 => p,
+                _ => match gl::build_program(g, gles) {
+                    Ok(p) => {
+                        SHARED_PROG.with(|c| c.set(Some(p)));
+                        p
+                    }
+                    Err(e) => return self.fallback(&format!("shader: {e}")),
+                },
+            };
+            let mut res = self.res.borrow_mut();
+            unsafe {
+                (g.gen_vertex_arrays())(1, &mut res.vao);
+                (g.gen_textures())(1, &mut res.tex);
+                (g.bind_texture())(gl::TEXTURE_2D, res.tex);
+                for (k, v) in [
+                    (gl::TEXTURE_MIN_FILTER, gl::NEAREST),
+                    (gl::TEXTURE_MAG_FILTER, gl::NEAREST),
+                    (gl::TEXTURE_WRAP_S, gl::CLAMP_TO_EDGE),
+                    (gl::TEXTURE_WRAP_T, gl::CLAMP_TO_EDGE),
+                ] {
+                    (g.tex_parameteri())(gl::TEXTURE_2D, k, v);
+                }
+            }
+            res.prog = Some(prog);
+            res.tex_alloc = 0;
+            self.cols.borrow_mut().full = true;
+            self.backend.set(Backend::Gl);
+        }
+
+        fn gl_unrealize(&self, a: &gtk::GLArea) {
+            let Some(g) = gl::api() else { return };
+            a.make_current();
+            let mut res = self.res.borrow_mut();
+            unsafe {
+                if res.tex != 0 {
+                    (g.delete_textures())(1, &res.tex);
+                }
+                if res.vao != 0 {
+                    (g.delete_vertex_arrays())(1, &res.vao);
+                }
+            }
+            *res = GlRes::default();
+            self.cols.borrow_mut().texw = 0;
+        }
+
+        // ------------------------------------------------------------------
+        // Per frame
+        // ------------------------------------------------------------------
+
+        fn on_tick(&self, frame_us: i64) {
+            let focused = self.obj().root().and_downcast::<gtk::Window>().is_some_and(|w| w.is_active());
+            let cap = if focused { MIN_FRAME_FG.with(Cell::get) } else { MIN_FRAME_BG.with(Cell::get) };
+            let last = self.last_frame.get();
+            if cap > 0 && frame_us - last < cap {
+                return;
+            }
+            self.last_frame.set(frame_us);
+            let dt_frame = (frame_us - last).clamp(0, 200_000);
+            let t0 = glib::monotonic_time();
+            let size = (self.obj().width(), self.obj().height());
+            let prev = self.last_size.replace(size);
+            if prev != (0, 0) && prev != size {
+                prof_add(|p| p.resizes += 1);
+            }
+            match self.backend.get() {
+                Backend::Gl => self.gl_tick(frame_us, dt_frame),
+                Backend::Gsk => {
+                    if let Some(b) = self.gsk_tick(frame_us) {
+                        prof_add(|p| {
+                            p.builds += 1;
+                            p.build_us += b;
+                        });
+                    }
+                }
+                Backend::Pending => {}
+            }
+            prof_add(|p| {
+                p.ticks += 1;
+                p.tick_us += glib::monotonic_time() - t0;
+            });
+        }
+
+        /// Reads the series' generations and sample interval; adapts the
+        /// display delay. Returns (any data changed, interval).
+        fn poll_data(&self) -> (bool, i64) {
+            let mut changed = false;
+            let mut interval = 0i64;
+            crate::app::with_shared(|s| {
+                let lines = self.lines.borrow();
+                let mut gens = self.gens.borrow_mut();
+                if gens.len() != lines.len() {
+                    gens.clear();
+                    gens.resize(lines.len(), u64::MAX);
+                }
+                for (l, g) in lines.iter().zip(gens.iter()) {
+                    if let Some(series) = l.key.series(&s.hist) {
+                        changed |= series.gen != *g;
+                        interval = interval.max(series.interval_us().unwrap_or(0));
+                    }
+                }
+            });
+            // Run 1.5 sample intervals behind real time so a slightly late
+            // sample never leaves the live edge empty. Hysteresis keeps it stable.
+            if interval > 0 {
+                let target = interval * 3 / 2 + 10_000;
+                let d = self.delay.get();
+                if d == 0 || (target - d).abs() > d / 4 {
+                    self.delay.set(target);
+                }
+            }
+            (changed, interval)
+        }
+
+        fn gl_tick(&self, frame_us: i64, dt_frame: i64) {
+            let obj = self.obj();
+            let (w, h) = (obj.width(), obj.height());
+            if w <= 1 || h <= 1 {
+                return;
+            }
+            let scale = obj.native().and_then(|n| n.surface()).map(|s| s.scale()).unwrap_or(1.0);
+            // Use the real framebuffer size once known (GTK may round differently).
+            let (fw, fh) = self.fbo.get();
+            let est = ((w as f64 * scale).round() as i32, (h as f64 * scale).round() as i32);
+            let wdev = if fw > 0 && (fw - est.0).abs() <= 1 && (fh - est.1).abs() <= 1 { fw } else { est.0 } as i64;
+            self.dev_scale.set(scale);
+            let window = self.window_us().max(1_000_000);
+            let (data_changed, interval) = self.poll_data();
+            let delay = self.delay.get();
+            let disp = frame_us - delay;
+            self.disp.set(disp);
+            let dt = window as f64 / wdev as f64;
+            let u0 = disp as f64 / dt;
+            self.u0.set(u0);
+            let right = u0.floor() as i64;
+            let ahead = ((delay + interval.max(100_000) * 2) as f64 / dt).ceil() as i64 + 4;
+            let texw = (wdev + ahead + 8) as usize;
+            let n = self.lines.borrow().len().min(2);
+
+            let mut cols = self.cols.borrow_mut();
+            let structural = cols.texw != texw || (cols.dt - dt).abs() > 1e-9 || cols.n != n;
+            if structural {
+                cols.reset(texw, dt, n);
+            }
+            let mut updated = false;
+            if structural || data_changed {
+                let t0 = glib::monotonic_time();
+                let c_lo = right - wdev - 2;
+                let c_from = if structural || cols.final_until == i64::MIN { c_lo } else { cols.final_until.max(c_lo) };
+                let c_to = right + ahead;
+                let since = (c_from as f64 * dt) as i64 - interval.max(100_000) * 2 - dt as i64;
+                let smooth = SMOOTH.with(Cell::get);
+                let lines = self.lines.borrow();
+                let mut pts = self.pts.borrow_mut();
+                pts.resize_with(lines.len(), Vec::new);
+                let mut newest = i64::MAX;
+                crate::app::with_shared(|s| {
+                    let mut gens = self.gens.borrow_mut();
+                    for (i, l) in lines.iter().enumerate().take(4) {
+                        match l.key.series(&s.hist) {
+                            Some(series) => {
+                                series.copy_since(since, &mut pts[i]);
+                                gens[i] = series.gen;
+                                newest = newest.min(series.last().map_or(i64::MIN, |p| p.0));
+                            }
+                            None => pts[i].clear(),
+                        }
+                    }
+                });
+                for (i, p) in pts.iter().enumerate().take(n) {
+                    cols.update_series(i, p, c_from, c_to, smooth);
+                }
+                cols.update_env(c_from, c_to);
+                if newest != i64::MAX && newest != i64::MIN {
+                    cols.final_until = (newest as f64 / dt - 0.5).floor() as i64;
+                }
+                // Y range target from what is (about to be) visible.
+                if let Some(Scale::Auto { floor }) = self.scale.get() {
+                    let peak = cols.max_in(right - wdev, right + 1);
+                    let target = crate::format::nice_ceiling(peak.max(floor) * 1.08);
+                    if target != self.ymax_target.get() {
+                        self.ymax_target.set(target);
+                        if let Some(cb) = self.on_ymax.borrow().as_ref() {
+                            cb(target);
+                        }
+                    }
+                    if structural {
+                        self.ymax.set(target);
+                    }
+                }
+                updated = true;
+                prof_add(|p| {
+                    p.builds += 1;
+                    p.build_us += glib::monotonic_time() - t0;
+                });
+            }
+            drop(cols);
+
+            // Ease the y axis: quickly up (avoid clipping), gently down.
+            let (cur, tgt) = (self.ymax.get(), self.ymax_target.get());
+            let mut easing = false;
+            if self.scale.get() != Some(Scale::Unit) && (cur - tgt).abs() > tgt * 0.002 {
+                let tau = if tgt > cur { 90_000.0 } else { 450_000.0 };
+                let k = 1.0 - (-(dt_frame.max(1) as f64) / tau).exp();
+                self.ymax.set(cur + (tgt - cur) * k as f32);
+                easing = true;
+            } else if self.scale.get() == Some(Scale::Unit) {
+                self.ymax.set(1.0);
+            }
+
+            // Render only if something visibly changed.
+            let cfg = (theme::generation(), CFG_GEN.with(Cell::get));
+            let moved = (u0 - self.last_u0.get()).abs();
+            let since_render = frame_us - self.last_render.get();
+            let need = structural
+                || easing
+                || cfg != self.rendered_cfg.get()
+                || moved >= 0.25
+                || (updated && (moved >= 0.05 || since_render >= 250_000));
+            if need {
+                if let Some(a) = self.area.borrow().as_ref() {
+                    a.queue_render();
+                }
+                self.last_render.set(frame_us);
+            }
+        }
+
+        fn gl_render(&self, _a: &gtk::GLArea) {
+            let Some(g) = gl::api() else { return };
+            let t0 = glib::monotonic_time();
+            let res = self.res.borrow();
+            let Some(prog) = res.prog else { return };
+            let (mut fw, mut fh) = self.fbo.get();
+            if fw <= 0 || fh <= 0 {
+                let mut vp = [0i32; 4];
+                unsafe { (g.get_integerv())(gl::VIEWPORT, vp.as_mut_ptr()) };
+                (fw, fh) = (vp[2].max(1), vp[3].max(1));
+                self.fbo.set((fw, fh));
+            }
+            unsafe { (g.viewport())(0, 0, fw, fh) };
+
+            let mut cols = self.cols.borrow_mut();
+            if cols.texw == 0 {
+                return;
+            }
+            let mut bytes = 0u64;
+            unsafe {
+                (g.active_texture())(gl::TEXTURE0);
+                (g.bind_texture())(gl::TEXTURE_2D, res.tex);
+                (g.pixel_storei())(gl::UNPACK_ALIGNMENT, 4);
+                if cols.full || res.tex_alloc != cols.texw {
+                    // Row 0: values; row 1: envelopes.
+                    (g.tex_image_2d())(
+                        gl::TEXTURE_2D,
+                        0,
+                        gl::RGBA32F,
+                        cols.texw as i32,
+                        2,
+                        0,
+                        gl::RGBA,
+                        gl::FLOAT,
+                        std::ptr::null(),
+                    );
+                    for (row, buf) in [(0, &cols.data), (1, &cols.env)] {
+                        (g.tex_sub_image_2d())(
+                            gl::TEXTURE_2D,
+                            0,
+                            0,
+                            row,
+                            cols.texw as i32,
+                            1,
+                            gl::RGBA,
+                            gl::FLOAT,
+                            buf.as_ptr() as *const _,
+                        );
+                    }
+                    bytes += (cols.texw * 32) as u64;
+                    cols.full = false;
+                    cols.dirty = None;
+                    drop(res);
+                    self.res.borrow_mut().tex_alloc = cols.texw;
+                } else {
+                    drop(res);
+                    for (slot, len) in cols.take_dirty() {
+                        for (row, buf) in [(0, &cols.data), (1, &cols.env)] {
+                            (g.tex_sub_image_2d())(
+                                gl::TEXTURE_2D,
+                                0,
+                                slot as i32,
+                                row,
+                                len as i32,
+                                1,
+                                gl::RGBA,
+                                gl::FLOAT,
+                                buf[slot..slot + len].as_ptr() as *const _,
+                            );
+                        }
+                        bytes += (len * 32) as u64;
+                    }
+                }
+            }
+            let texw = cols.texw;
+            let n = cols.n;
+            drop(cols);
+
+            // Uniforms.
+            let p = theme::palette();
+            let lines = self.lines.borrow();
+            let mut fill = [0f32; 8];
+            let mut line = [0f32; 8];
+            for (i, l) in lines.iter().enumerate().take(2) {
+                let c = theme::rgba(l.color.value(&p), 1.0);
+                let fa = p.fill_alpha();
+                if l.fill {
+                    fill[i * 4..i * 4 + 4].copy_from_slice(&[c.red() * fa, c.green() * fa, c.blue() * fa, fa]);
+                }
+                line[i * 4..i * 4 + 4].copy_from_slice(&[c.red(), c.green(), c.blue(), 1.0]);
+            }
+            let grid = if self.grid.get() {
+                let gc = theme::rgba(p.fg, 1.0);
+                let ga = p.grid_alpha();
+                [gc.red() * ga, gc.green() * ga, gc.blue() * ga, ga]
+            } else {
+                [0.0; 4]
+            };
+            // Vertical time grid: positions in device px from the left edge.
+            let window = self.window_us().max(1);
+            let dt = window as f64 / fw as f64;
+            let disp = self.disp.get();
+            let step = grid_step_us(window);
+            let mut vgrid = [0f32; 8];
+            let mut nv = 0;
+            let mut t = disp - disp.rem_euclid(step);
+            while t > disp - window && nv < 8 {
+                vgrid[nv] = (fw as f64 - (disp - t) as f64 / dt) as f32;
+                nv += 1;
+                t -= step;
+            }
+            let u0 = self.u0.get();
+            let scale = self.dev_scale.get().max(1.0) as f32;
+            let res = self.res.borrow();
+            unsafe {
+                (g.disable())(gl::BLEND);
+                (g.disable())(gl::DEPTH_TEST);
+                (g.disable())(gl::SCISSOR_TEST);
+                (g.use_program())(prog.id);
+                let l = prog.loc;
+                (g.uniform1i())(l.data, 0);
+                (g.uniform1i())(l.texw, texw as i32);
+                (g.uniform1f())(l.u0, u0.rem_euclid(texw as f64) as f32);
+                (g.uniform2f())(l.size, fw as f32, fh as f32);
+                (g.uniform1f())(l.ymax, self.ymax.get().max(1e-6));
+                (g.uniform1f())(l.pad, 2.0 * scale);
+                (g.uniform1i())(l.n, n as i32);
+                (g.uniform4fv())(l.fill, 2, fill.as_ptr());
+                (g.uniform4fv())(l.line, 2, line.as_ptr());
+                (g.uniform1f())(l.hw, LINE_PX.with(Cell::get) * 0.5);
+                (g.uniform4fv())(l.grid, 1, grid.as_ptr());
+                (g.uniform1fv())(l.vgrid, 8, vgrid.as_ptr());
+                (g.uniform1i())(l.nv, nv as i32);
+                (g.bind_vertex_array())(res.vao);
+                (g.draw_arrays())(gl::TRIANGLES, 0, 3);
+                (g.bind_vertex_array())(0);
+                (g.use_program())(0);
+            }
+            self.last_u0.set(u0);
+            self.rendered_cfg.set((theme::generation(), CFG_GEN.with(Cell::get)));
+            prof_add(|pr| {
+                pr.draws += 1;
+                pr.draw_us += glib::monotonic_time() - t0;
+                pr.upload_bytes += bytes;
+            });
+        }
+
+        // ------------------------------------------------------------------
+        // Fallback renderer (no OpenGL): GskPath → texture per sample.
+        // ------------------------------------------------------------------
+
+        fn gsk_draw(&self, snapshot: &gtk::Snapshot) {
             let w = self.obj().width() as f32;
             let h = self.obj().height() as f32;
             if w <= 1.0 || h <= 1.0 {
                 return;
             }
             let p = theme::palette();
-            let bounds = graphene::Rect::new(0.0, 0.0, w, h);
-            snapshot.push_clip(&bounds);
-
-            // Grid: 3 horizontal rules + scrolling verticals every 10 s.
+            snapshot.push_clip(&graphene::Rect::new(0.0, 0.0, w, h));
             if self.grid.get() {
-                let grid = theme::rgba(p.fg, if p.dark { 0.07 } else { 0.09 });
+                let grid = theme::rgba(p.fg, p.grid_alpha());
                 for i in 1..4 {
                     let y = (h * i as f32 / 4.0).round();
                     snapshot.append_color(&grid, &graphene::Rect::new(0.0, y, w, 1.0));
@@ -305,18 +906,12 @@ mod imp {
                     t -= step;
                 }
             }
-
             if let Some(tex) = self.tex.borrow().as_ref() {
                 let window = self.built_window.get().max(1);
                 let pps = w as f64 / window as f64;
                 let off = ((self.disp.get() - self.built_disp.get()) as f64 * pps) as f32;
                 let tw = self.tex_w.get();
-                // Never scroll past the end of the texture (late sample).
                 let off = off.clamp(0.0, (tw - w).max(0.0));
-                // Pixel-exact: the texture is drawn at exactly its own pixel
-                // size and the scroll offset snaps to device pixels, so line
-                // edges land on the pixel grid instead of being resampled
-                // (which softens them and shimmers while scrolling).
                 let s = self.built_scale.get().max(1.0) as f32;
                 let off = (off * s).round() / s;
                 let (rw, rh) = (tex.width() as f32 / s, tex.height() as f32 / s);
@@ -326,22 +921,8 @@ mod imp {
             snapshot.pop();
         }
 
-        fn on_tick(&self, frame_us: i64) {
-            let t0 = if prof_enabled() { glib::monotonic_time() } else { 0 };
-            let rebuilt = self.tick_inner(frame_us);
-            if prof_enabled() {
-                let total = glib::monotonic_time() - t0;
-                prof_add(total - rebuilt.unwrap_or(0), rebuilt, None);
-            }
-        }
-
         /// Returns the rebuild time in µs if a rebuild happened.
-        fn tick_inner(&self, frame_us: i64) -> Option<i64> {
-            let min = MIN_FRAME_US.with(Cell::get);
-            if min > 0 && frame_us - self.last_frame.get() < min {
-                return None;
-            }
-            self.last_frame.set(frame_us);
+        fn gsk_tick(&self, frame_us: i64) -> Option<i64> {
             let obj = self.obj();
             let size = (obj.width(), obj.height());
             if size.0 <= 1 || size.1 <= 1 {
@@ -349,115 +930,68 @@ mod imp {
             }
             let scale = obj.native().and_then(|n| n.surface()).map(|s| s.scale()).unwrap_or(1.0);
             let window = self.window_us();
-
-            // Has anything we draw changed? (structural changes always rebuild)
+            let cfg = CFG_GEN.with(Cell::get);
             let structural = size != self.built_size.get()
                 || scale != self.built_scale.get()
                 || theme::generation() != self.built_theme.get()
-                || window != self.built_window.get();
-            let mut changed = structural;
-            let mut new_data = false;
-            let mut interval = 0i64;
-            crate::app::with_shared(|s| {
-                let lines = self.lines.borrow();
-                let mut gens = self.built_gens.borrow_mut();
-                if gens.len() != lines.len() {
-                    gens.resize(lines.len(), u64::MAX);
-                    changed = true;
-                }
-                for (l, g) in lines.iter().zip(gens.iter()) {
-                    if let Some(series) = l.key.series(&s.hist) {
-                        if series.gen != *g {
-                            new_data = true;
-                        }
-                        interval = interval.max(series.interval_us().unwrap_or(0));
-                    }
-                }
-            });
-            // Run one sample interval (plus slack) behind real time.
-            if interval > 0 {
-                let target = interval + interval / 8 + 8_000;
-                let d = self.delay.get();
-                // Adapt quickly when the rate changes, otherwise hold steady.
-                let d = if d == 0 || (target - d).abs() > d / 4 { target } else { d };
-                self.delay.set(d);
-            }
+                || window != self.built_window.get()
+                || cfg != self.built_cfg.get();
+            let (new_data, interval) = self.poll_data();
             let disp = frame_us - self.delay.get();
             self.disp.set(disp);
-
-            // Rebuild if data changed, or we're about to run off the texture.
-            // On long time scales a new sample moves the curve by a fraction of
-            // a pixel, so new data only triggers a rebuild once the curve has
-            // moved at least one device pixel (or after 1 s).
             let tw = self.tex_w.get();
             let pps = size.0 as f64 / window.max(1) as f64;
             let off = (disp - self.built_disp.get()) as f64 * pps;
+            let mut changed = structural;
             if new_data {
-                let moved_px = off * scale;
                 let since = frame_us - self.last_rebuild.get();
-                if moved_px >= 1.0 || since >= 1_000_000 || window <= 120_000_000 {
+                if off * scale >= 1.0 || since >= 1_000_000 || window <= 120_000_000 {
                     changed = true;
                 }
             }
-            let mut rebuilt = None;
             if changed || self.tex.borrow().is_none() || off as f32 > (tw - size.0 as f32) * 0.8 {
                 let t0 = glib::monotonic_time();
-                self.rebuild(size, scale, window, disp, interval);
+                self.gsk_rebuild(size, scale, window, disp, interval);
                 self.last_rebuild.set(frame_us);
-                rebuilt = Some(glib::monotonic_time() - t0);
                 obj.queue_draw();
-            } else {
-                // Skip frames that would be pixel-identical (slow scroll).
-                let off_px = ((disp - self.built_disp.get()) as f64 * pps * scale).round() as i64;
-                if off_px != self.last_off_px.get() {
-                    self.last_off_px.set(off_px);
-                    obj.queue_draw();
-                }
+                return Some(glib::monotonic_time() - t0);
             }
-            rebuilt
+            let off_px = ((disp - self.built_disp.get()) as f64 * pps * scale).round() as i64;
+            if off_px != self.last_off_px.get() {
+                self.last_off_px.set(off_px);
+                obj.queue_draw();
+            }
+            None
         }
 
-        pub(super) fn window_us(&self) -> i64 {
-            self.window_override.get().unwrap_or_else(|| HISTORY_US.with(Cell::get))
-        }
-
-        fn rebuild(&self, (w, h): (i32, i32), scale: f64, window: i64, disp: i64, interval: i64) {
+        fn gsk_rebuild(&self, (w, h): (i32, i32), scale: f64, window: i64, disp: i64, interval: i64) {
             let obj = self.obj();
             let Some(renderer) = obj.native().and_then(|n| n.renderer()) else { return };
             let (wf, hf) = (w as f32, h as f32);
             let pps = wf as f64 / window.max(1) as f64;
-            // Extra width: enough to keep scrolling ~2.5 intervals until the next sample.
             let margin = ((interval.max(50_000) as f64 * 2.5 + 150_000.0) * pps).ceil() as f32 + 4.0;
             let tw = wf + margin;
             let since = disp - window - interval.max(100_000) * 2;
-
             let lines = self.lines.borrow().clone();
             let mut pts = self.pts.borrow_mut();
             pts.resize_with(lines.len(), Vec::new);
-            let mut gens = Vec::with_capacity(lines.len());
             crate::app::with_shared(|s| {
-                for (l, buf) in lines.iter().zip(pts.iter_mut()) {
+                let mut gens = self.gens.borrow_mut();
+                for (i, l) in lines.iter().enumerate() {
                     match l.key.series(&s.hist) {
                         Some(series) => {
-                            series.copy_since(since, buf);
-                            gens.push(series.gen);
+                            series.copy_since(since, &mut pts[i]);
+                            if let Some(g) = gens.get_mut(i) {
+                                *g = series.gen;
+                            }
                         }
-                        None => {
-                            buf.clear();
-                            gens.push(0);
-                        }
+                        None => pts[i].clear(),
                     }
                 }
             });
-
-            // More points than pixels (long history, high sample rate)? Keep
-            // each pixel column's peak so rebuild cost is bounded by width.
-            let px_per_us = pps as f64;
             for buf in pts.iter_mut() {
-                decimate(buf, px_per_us, disp, wf as f64);
+                decimate(buf, pps, disp, wf as f64);
             }
-
-            // Y range.
             let ymax = match self.scale.get().unwrap_or(Scale::Unit) {
                 Scale::Unit => 1.0,
                 Scale::Auto { floor } => {
@@ -469,7 +1003,6 @@ mod imp {
                         .fold(0.0f32, f32::max);
                     let target = crate::format::nice_ceiling(peak.max(floor) * 1.08);
                     let cur = self.ymax.get();
-                    // Expand instantly (no clipping), shrink gently.
                     let next = if target >= cur { target } else { cur + (target - cur) * 0.15 };
                     if let Some(cb) = self.on_ymax.borrow().as_ref() {
                         cb(next);
@@ -478,7 +1011,6 @@ mod imp {
                 }
             };
             self.ymax.set(ymax);
-
             let p = theme::palette();
             let s = scale as f32;
             let snap = gtk::Snapshot::new();
@@ -504,8 +1036,6 @@ mod imp {
                     }
                     let mut prev = (x0, y0);
                     if smooth {
-                        // Catmull-Rom through every sample, control points clamped
-                        // to each segment's y-range so curves never overshoot.
                         let p: Vec<(f32, f32)> = buf.iter().map(xy).collect();
                         for i in 0..p.len() - 1 {
                             let p0 = p[i.saturating_sub(1)];
@@ -518,7 +1048,6 @@ mod imp {
                         }
                         prev = *p.last().unwrap();
                     } else {
-                        // Default: straight segments, so peaks stay sharp.
                         for pt in &buf[1..] {
                             let (x, y) = xy(pt);
                             b.line_to(x, y);
@@ -529,37 +1058,23 @@ mod imp {
                     if pass {
                         b.line_to(prev.0, hf * s);
                         b.close();
-                        let alpha = if p.dark { 0.28 } else { 0.22 };
-                        snap.append_fill(&b.to_path(), gsk::FillRule::Winding, &theme::rgba(color, alpha));
+                        snap.append_fill(&b.to_path(), gsk::FillRule::Winding, &theme::rgba(color, p.fill_alpha()));
                     } else {
-                        let stroke = gsk::Stroke::new(1.5 * s);
+                        let stroke = gsk::Stroke::new(LINE_PX.with(Cell::get));
                         stroke.set_line_join(gsk::LineJoin::Miter);
                         stroke.set_miter_limit(5.0);
-                        stroke.set_line_cap(gsk::LineCap::Butt);
                         snap.append_stroke(&b.to_path(), &stroke, &theme::rgba(color, 1.0));
                     }
                 }
             }
             drop(pts);
             let viewport = graphene::Rect::new(0.0, 0.0, (tw * s).ceil(), (hf * s).ceil());
-            let tex = match snap.to_node() {
-                Some(node) => renderer.render_texture(&node, Some(&viewport)),
-                None => {
-                    self.tex.replace(None);
-                    self.finish(gens, (w, h), scale, window, disp, tw);
-                    return;
-                }
-            };
-            self.tex.replace(Some(tex));
-            self.finish(gens, (w, h), scale, window, disp, tw);
-        }
-
-        fn finish(&self, gens: Vec<u64>, size: (i32, i32), scale: f64, window: i64, disp: i64, tw: f32) {
-            *self.built_gens.borrow_mut() = gens;
-            self.built_size.set(size);
+            self.tex.replace(snap.to_node().map(|node| renderer.render_texture(&node, Some(&viewport))));
+            self.built_size.set((w, h));
             self.built_scale.set(scale);
             self.built_theme.set(theme::generation());
             self.built_window.set(window);
+            self.built_cfg.set(CFG_GEN.with(Cell::get));
             self.built_disp.set(disp);
             self.tex_w.set(tw);
         }
@@ -608,7 +1123,6 @@ mod tests {
 
     #[test]
     fn decimate_keeps_peaks() {
-        // 1000 points over 100 px → ≤ ~101 points, peak preserved.
         let mut v: Vec<(i64, f32)> = (0..1000).map(|i| (i as i64 * 1000, if i == 500 { 9.0 } else { 1.0 })).collect();
         super::decimate(&mut v, 100.0 / 1_000_000.0, 1_000_000, 100.0);
         assert!(v.len() <= 102, "{}", v.len());
@@ -630,6 +1144,14 @@ impl Graph {
         g.set_hexpand(true);
         g.set_vexpand(true);
         g.update_property(&[gtk::accessible::Property::Label("Usage history graph")]);
+        let force_gsk = std::env::var("PLUME_GRAPH").is_ok_and(|v| v == "gsk");
+        // The shader handles up to two series per graph (all of Plume's graphs).
+        if force_gsk || gl::api().is_none() || lines.len() > 2 {
+            RENDERER.with(|r| r.set("fallback (GskPath textures)"));
+            g.imp().use_gsk();
+        } else {
+            g.imp().setup_gl();
+        }
         g
     }
 
@@ -661,7 +1183,7 @@ impl Graph {
         self.set_tooltip_text(Some(if need_ctrl { "Ctrl+scroll to change the time scale" } else { "Scroll to change the time scale" }));
     }
 
-    /// Called with the current axis maximum whenever an auto-scaled graph rebuilds.
+    /// Called with the axis maximum whenever an auto-scaled graph's target changes.
     pub fn connect_ymax(&self, f: impl Fn(f32) + 'static) {
         self.imp().on_ymax.replace(Some(Box::new(f)));
     }

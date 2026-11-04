@@ -40,7 +40,8 @@ impl I915 {
             out.busy = None;
             return;
         };
-        out.busy = residency_busy(self.last_us, self.last_rc6_ms, now_us, rc6).or(out.busy);
+        out.awake = residency_busy(self.last_us, self.last_rc6_ms, now_us, rc6).or(out.awake);
+        out.busy = out.awake;
         self.last_rc6_ms = rc6;
         self.last_us = now_us;
     }
@@ -73,7 +74,8 @@ impl Xe {
             out.busy = None;
             return;
         };
-        out.busy = residency_busy(self.last_us, self.last_idle_ms, now_us, idle).or(out.busy);
+        out.awake = residency_busy(self.last_us, self.last_idle_ms, now_us, idle).or(out.awake);
+        out.busy = out.awake;
         self.last_idle_ms = idle;
         self.last_us = now_us;
     }

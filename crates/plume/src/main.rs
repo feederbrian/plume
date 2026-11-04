@@ -6,6 +6,7 @@ mod format;
 mod inspector;
 mod pages;
 mod prefs;
+mod profile;
 mod settings;
 mod theme;
 mod widgets;

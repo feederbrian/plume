@@ -22,13 +22,13 @@
 ## Features
 
 - **Per-process tabs, like Activity Monitor.** CPU, Memory, Disk and Network each show the process list with the columns that matter for that resource, plus a live summary panel. Search, filter and selection carry across tabs.
-- **Smooth, sharp, live graphs.** Curves are drawn by the GPU once per sample and slid into place every frame, so they glide at 60 fps for about 1 % of one CPU core.
+- **Smooth, sharp, live graphs.** A tiny GPU shader draws every graph each frame from a few hundred bytes of new data per sample, so lines are exactly as thin as you set them and glide at 60 fps without stutter.
 - **Any time scale.** From 30 seconds to 1 hour, set in the header bar, with Ctrl+scroll over any graph, or separately for each floating readout.
 - **Floating readouts.** Pop any graph out into a small always-on-top window, macOS-style.
-- **Laptop-friendly GPU monitoring.** Intel, NVIDIA and AMD. A sleeping discrete GPU is never woken up just to be measured.
+- **Laptop-friendly GPU monitoring.** Intel, NVIDIA and AMD, with real engine utilisation and a per-process **% GPU** column. A sleeping discrete GPU is never woken up just to be measured.
 - **Process control.** End, kill, stop, continue and re-prioritise, with protection against acting on a recycled PID, and an administrator prompt for other users' processes.
 - **An inspector for every process.** Command line, executable, working directory, systemd unit, memory breakdown, I/O, network, open files, context switches.
-- **Fifteen themes.** Follows GNOME's light/dark setting, or pick Tokyo Night, Solarized, Nord, Gruvbox, Dracula, Catppuccin, One Dark and more.
+- **Sixteen themes, OLED included.** Follows GNOME's light/dark setting, or pick OLED Black, Tokyo Night, Solarized, Nord, Gruvbox, Dracula, Catppuccin, One Dark and more. A **pure black** switch makes any dark theme OLED-friendly.
 
 ## A look around
 
@@ -50,12 +50,18 @@
   </tr>
 </table>
 
+### OLED
+
+<img src="docs/screenshots/oled.png" alt="The Overview in the OLED Black theme: pure black background, thin bright graph lines">
+
+**OLED Black** leaves unused pixels off: pure black surfaces, softened text (pure white blooms on OLED) and hairline borders instead of shadows. Prefer another palette? Turn on **Preferences → Appearance → Pure black backgrounds** to get it on true black.
+
 ## Install
 
 Download the latest `.deb` from [**Releases**](https://github.com/feederbrian/plume/releases/latest), then:
 
 ```bash
-sudo apt install ./plume_0.1.0_amd64.deb
+sudo apt install ./plume_0.2.0_amd64.deb
 ```
 
 Plume appears in your applications as **Plume**. It needs Ubuntu 24.04 or newer (GTK ≥ 4.14, libadwaita ≥ 1.5) and runs on X11 or Wayland.
@@ -93,23 +99,24 @@ IDs: `cpu`, `cores`, `mem`, `gpu0`, `gpu1`, `net`, `disk`. Running `plume` again
 | <kbd>Enter</kbd>, double-click, <kbd>Ctrl</kbd>+<kbd>I</kbd> | Open the process inspector |
 | Right-click a process | Actions and priority |
 | <kbd>Ctrl</kbd>+scroll on a graph, <kbd>Ctrl</kbd>+<kbd>−</kbd> / <kbd>Ctrl</kbd>+<kbd>=</kbd> | Longer / shorter time scale |
-| <kbd>Ctrl</kbd>+<kbd>,</kbd> | Preferences |
+| <kbd>Ctrl</kbd>+<kbd>,</kbd> | Preferences: theme, line width, frame rates, sampling, time scale |
 
 ## Hardware support
 
 | | What Plume reads | Needs root? |
 |---|---|---|
 | **CPU** | Usage per logical core, kernel/user split, frequency, package temperature, pressure (PSI) | No |
-| **Intel graphics** (i915, xe) | Busy time from the RC6 / idle residency counter, current and maximum frequency | No |
+| **Intel graphics** (i915, xe) | Engine utilisation and per-process GPU (DRM fdinfo), time awake (RC6), frequency | No |
 | **NVIDIA** | Utilisation, VRAM, temperature, power and clocks via NVML. Polled only while the GPU is awake | No |
-| **AMD** | `gpu_busy_percent`, VRAM and sensors via sysfs | No |
+| **AMD** | `gpu_busy_percent`, per-process GPU (DRM fdinfo), VRAM and sensors | No |
 | **Disks** | Throughput, IOPS and active time for physical disks; filesystem usage | No |
 | **Network** | Interface throughput and packets; per-process TCP traffic | No (other users' processes: root) |
 
 ## Known limitations
 
 - Per-process network figures cover **TCP connections**. UDP traffic, including QUIC/HTTP3, which browsers use heavily, isn't attributed to processes. Interface totals are always complete.
-- Version 0.1 was developed and tested in a VM, where the NVIDIA path and the shell extension couldn't be exercised. Reports from real hardware are very welcome; please [open an issue](https://github.com/feederbrian/plume/issues).
+- Per-process GPU figures come from DRM accounting, so they cover Intel and AMD GPUs and your own processes. The NVIDIA driver doesn't expose them this way.
+- Development happens largely in a VM without a GPU. Reports from real hardware are very welcome; please [open an issue](https://github.com/feederbrian/plume/issues). Run with `PLUME_PROFILE=1` to include frame-pacing numbers.
 
 ## Build from source
 
@@ -131,7 +138,7 @@ cargo test --release
 ./packaging/build-deb.sh
 ```
 
-`cargo run` starts Plume, `cargo test` runs the 30 tests (including a live TCP attribution test), and the packaging script builds `plume_<version>_amd64.deb`. [docs/DESIGN.md](docs/DESIGN.md) covers the architecture, the performance decisions and the measurements.
+`cargo run` starts Plume, `cargo test` runs the 36 tests (including a live TCP attribution test), and the packaging script builds `plume_<version>_amd64.deb`. [docs/DESIGN.md](docs/DESIGN.md) covers the architecture, the performance decisions and the measurements.
 
 ## License
 

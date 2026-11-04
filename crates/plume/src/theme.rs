@@ -148,9 +148,46 @@ pub const THEMES: &[Palette] = &[
         rx: 0x56b6c2, tx: 0xd19a66, read: 0x98c379, write: 0xe06c75,
         cores: [0x61afef, 0x98c379, 0xe5c07b, 0xd19a66, 0xe06c75, 0xc678dd, 0x56b6c2, 0xabb2bf],
     },
+    Palette {
+        // True black for OLED panels: unlit background, softened text (pure
+        // white blooms on OLED), vivid but not neon graph colours.
+        id: "oled-black", name: "OLED Black", dark: true,
+        ui: ui(0x000000, 0x000000, 0x000000, 0x000000, 0x0c0c0c, 0xd4d4d4, 0x4c8dff, 0x000000, 0xff5c6c),
+        fg: 0xd4d4d4, cpu: 0x4c9aff, kernel: 0xff5c7a, mem: 0xb38cff, swap: 0xffa94d, gpu: 0x3ddc97,
+        rx: 0x3fc5ff, tx: 0xffa94d, read: 0x3ddc97, write: 0xff5c7a,
+        cores: [0x4c9aff, 0x3ddc97, 0xffd24d, 0xffa94d, 0xff5c7a, 0xb38cff, 0x3fc5ff, 0x8f9bff],
+    },
 ];
 
+impl Palette {
+    /// Opacity of the area under graph lines.
+    pub fn fill_alpha(&self) -> f32 {
+        if oled() {
+            0.20
+        } else if self.dark {
+            0.28
+        } else {
+            0.22
+        }
+    }
+    pub fn grid_alpha(&self) -> f32 {
+        if oled() {
+            0.09
+        } else if self.dark {
+            0.07
+        } else {
+            0.09
+        }
+    }
+}
+
+/// True-black mode is active (OLED Black theme, or the OLED switch on a dark theme).
+pub fn oled() -> bool {
+    OLED.with(Cell::get)
+}
+
 thread_local! {
+    static OLED: Cell<bool> = const { Cell::new(false) };
     static ACTIVE: Cell<Palette> = const { Cell::new(THEMES[0]) };
     static GEN: Cell<u64> = const { Cell::new(1) };
     static PROVIDER: RefCell<Option<gtk::CssProvider>> = const { RefCell::new(None) };
@@ -197,6 +234,23 @@ pub fn apply(id: &str) {
         let d = find("adwaita-dark");
         p = Palette { id: "system", name: THEMES[0].name, ..d };
     }
+    let black = p.id == "oled-black" || (p.dark && crate::settings::with(|s| s.oled));
+    if black && p.id != "oled-black" {
+        // Keep the theme's colours, but unlit (true black) surfaces.
+        let base = p.ui.unwrap_or(Ui {
+            window: 0,
+            view: 0,
+            card: 0,
+            header: 0,
+            popover: 0,
+            fg: 0xdedede,
+            accent: 0x78aeed,
+            accent_fg: 0x000000,
+            destructive: 0xff7b63,
+        });
+        p.ui = Some(Ui { window: 0x000000, view: 0x000000, card: 0x000000, header: 0x000000, popover: 0x0c0c0c, ..base });
+    }
+    OLED.with(|o| o.set(black));
     ACTIVE.with(|a| a.set(p));
     GEN.with(|g| g.set(g.get() + 1));
 
@@ -241,6 +295,15 @@ fn ui_css(u: Ui) -> String {
     let mut css = String::new();
     for (k, v) in pairs {
         css.push_str(&format!("@define-color {k} {};\n", hex(v)));
+    }
+    if oled() {
+        // On black, drop shadows are invisible (and cost GPU blur passes):
+        // separate surfaces with hairlines instead.
+        css.push_str(
+            ".card, .plume-card { box-shadow: inset 0 0 0 1px alpha(@view_fg_color, 0.10); }\n\
+             headerbar { box-shadow: inset 0 -1px alpha(@view_fg_color, 0.08); }\n\
+             popover > contents { box-shadow: 0 0 0 1px alpha(@view_fg_color, 0.14); }\n",
+        );
     }
     // libadwaita ≥ 1.6 reads CSS variables instead of named colours.
     if gtk::minor_version() >= 16 {

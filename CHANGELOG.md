@@ -1,5 +1,36 @@
 # Changelog
 
+## 0.2.0 — 2026-11-04
+
+Smoothness and efficiency, from a profiling pass on real-hardware feedback
+(i7-9750H, UHD 630 + RTX 2080 Max-Q, 4K OLED).
+
+### Graphs: new GPU renderer
+- Graphs are now drawn by a small OpenGL fragment shader through `GtkGLArea`. Each new sample uploads a few hundred bytes; each frame sets one scroll uniform and issues one draw call. The old renderer re-rasterised and re-uploaded every curve ten times a second; its texture renders could stall the UI thread and drop frames, which was the graph jitter.
+- Lines are computed per pixel at their exact sub-pixel position: perfectly even motion, no snapping or resampling blur.
+- **Line width** is now set in screen pixels (Hairline 1 px, Fine 1.5 px default, Medium 2 px, Bold 3 px). The previous default was 3 device pixels on a 2× display.
+- Auto-scaled axes (network, disk) ease smoothly every frame instead of stepping.
+- Graphs skip frames that wouldn't change and share one GL context per window.
+- The previous renderer remains as an automatic fallback without OpenGL.
+
+### Layout stability
+- The Overview uses a fixed one- or two-column layout chosen from the window width alone. Value labels have fixed widths, and stats sit in a fixed grid. Changing numbers no longer resize cards or the graphs inside them (measured: 0 graph resizes under load).
+
+### Process list
+- Refreshing the list now costs about 1 ms instead of 34–60 ms (213 ms worst case) with 300+ processes. Only on-screen rows re-render, off-screen rows catch up when scrolled to, and tooltips are produced on hover.
+
+### GPU accounting
+- Intel and AMD GPUs report real **engine utilisation** from the kernel's per-client DRM accounting (`fdinfo`), without root. The previous Intel figure measured time out of the RC6 sleep state. That figure is still shown as "Awake", but it overstates load: every frame anything draws wakes the GPU briefly.
+- New **% GPU** column on the CPU tab, per process (Intel/AMD).
+
+### Appearance
+- **OLED Black** theme: true black surfaces, softened text, vivid accents.
+- **Pure black backgrounds** switch: makes any dark theme OLED-friendly. In OLED mode, cards use hairline borders instead of blurred shadows.
+
+### Frame pacing
+- Separate frame-rate caps for the focused window (60 fps) and for floating readouts and background windows (30 fps).
+- `PLUME_PROFILE=1` now also reports frame pacing (late frames, gaps, phase times) and process-list refresh cost.
+
 ## 0.1.0 — 2026-11-04
 
 First release.

@@ -13,7 +13,7 @@
       <li>Floating readouts that stay on top (with the Plume Floats shell extension)</li>
       <li>Time scales from 30 seconds to one hour, globally or per floating readout</li>
       <li>End, kill, stop, continue and re-prioritise processes, with PID-reuse protection</li>
-      <li>Light, dark, Tokyo Night, Solarized, Nord, Gruvbox, Dracula, Catppuccin and more</li>
+      <li>Light, dark, OLED black, Tokyo Night, Solarized, Nord, Gruvbox, Dracula, Catppuccin and more</li>
     </ul>
   </description>
   <developer id="io.github.feederbrian">
@@ -39,6 +39,11 @@
   </screenshots>
   <content_rating type="oars-1.1"/>
   <releases>
+    <release version="0.2.0" date="2026-11-04">
+      <description>
+        <p>GPU-rendered graphs with exact, thin lines and even motion; stable layout; a much faster process list; real Intel/AMD engine utilisation and per-process GPU; an OLED Black theme.</p>
+      </description>
+    </release>
     <release version="0.1.0" date="2026-11-04"/>
   </releases>
 </component>

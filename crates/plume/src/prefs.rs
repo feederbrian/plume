@@ -59,6 +59,33 @@ pub fn show(parent: Option<&gtk::Window>) {
         theme::apply(id);
         app::sync_theme_action(id);
     }));
+    g.add(&switch(
+        "Pure black backgrounds",
+        "For OLED screens: unlit black surfaces with any dark theme",
+        s.oled,
+        |v| {
+            settings::update(|s| s.oled = v);
+            theme::apply(&settings::with(|s| s.theme.clone()));
+        },
+    ));
+    page.add(&g);
+
+    let g = adw::PreferencesGroup::new();
+    g.set_title("Graphs");
+    g.add(&combo(
+        "Line width",
+        "Thickness of graph lines, in screen pixels",
+        &[("Hairline (1 px)", 1.0f64), ("Fine (1.5 px)", 1.5), ("Medium (2 px)", 2.0), ("Bold (3 px)", 3.0)],
+        s.line_px,
+        |v| {
+            settings::update(|s| s.line_px = v);
+            graph::set_line_px(v as f32);
+        },
+    ));
+    g.add(&switch("Smooth curves", "Round the line through each sample (off: sharp, exact segments)", s.smooth, |v| {
+        settings::update(|s| s.smooth = v);
+        graph::set_smooth(v);
+    }));
     page.add(&g);
 
     let g = adw::PreferencesGroup::new();
@@ -83,17 +110,22 @@ pub fn show(parent: Option<&gtk::Window>) {
     let g = adw::PreferencesGroup::new();
     g.set_title("Graphs");
     g.set_description(Some(
-        "Graphs are drawn at the frame rate and interpolated between samples. \
-         Sampling faster than 10–20 Hz adds noise rather than detail.",
+        "Graphs only redraw when they visibly move. Each frame keeps the GPU awake, \
+         so lower rates save battery. Sampling faster than 10–20 Hz adds noise rather than detail.",
     ));
+    let fps_opts = [("15 fps", 15u32), ("30 fps", 30), ("60 fps", 60), ("120 fps", 120), ("Display refresh rate", 0)];
+    g.add(&combo("Frame rate", "Live graphs in the focused window", &fps_opts, s.fps_cap, |v| {
+        settings::update(|s| s.fps_cap = v);
+        graph::set_fps_caps(v, settings::with(|s| s.fps_cap_bg));
+    }));
     g.add(&combo(
-        "Frame rate",
-        "Maximum redraw rate of live graphs",
-        &[("30 fps", 30u32), ("60 fps", 60), ("120 fps", 120), ("Display refresh rate", 0)],
-        s.fps_cap,
+        "Background frame rate",
+        "Floating readouts and windows you're not using",
+        &fps_opts,
+        s.fps_cap_bg,
         |v| {
-            settings::update(|s| s.fps_cap = v);
-            graph::set_fps_cap(v);
+            settings::update(|s| s.fps_cap_bg = v);
+            graph::set_fps_caps(settings::with(|s| s.fps_cap), v);
         },
     ));
     g.add(&combo(
@@ -115,11 +147,6 @@ pub fn show(parent: Option<&gtk::Window>) {
         s.history_secs,
         app::set_time_scale,
     ));
-    g.add(&switch("Smooth curves", "Round the line through each sample (off: sharp, exact segments)", s.smooth, |v| {
-        settings::update(|s| s.smooth = v);
-        graph::set_smooth(v);
-        theme::apply(&settings::with(|s| s.theme.clone())); // forces a rebuild
-    }));
     page.add(&g);
     let g = adw::PreferencesGroup::new();
     g.set_title("Process List");

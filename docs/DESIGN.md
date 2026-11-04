@@ -36,7 +36,9 @@ crates/plume-core   data collection, no GTK dependency
   history                 two-tier ring buffers: 10 Hz for ~5 min, 1 s means for 1 h
   sampler                 two threads (fast 10 Hz, slow 4 Hz), driven by what's on screen
 crates/plume        GTK 4 / libadwaita app
-  widgets/graph           the graph widget (below)
+  widgets/graph           the graph widget (below); widgets/gl: GL loader + shader;
+                          widgets/columns: per-pixel column data; widgets/tiles: stable layout
+  profile                 PLUME_PROFILE frame-pacing profiler
   pages/processes         CPU / Memory / Disk / Network tabs
   pages/summary           bottom summary panels
   pages/resources         Overview dashboard: GPUs, per-core grid, filesystems
@@ -53,28 +55,48 @@ samples at 10 Hz (adjustable) and draws at the display's frame rate. Graphs run
 one sample interval behind real time, so there is always real data at the live
 edge and the scroll never waits for a sample.
 
-## The graph widget
+## The graph renderer
 
 Rebuilding and rasterising curves every frame is what made GNOME System
-Monitor's smooth graphs expensive. Plume splits the work:
+Monitor's smooth graphs expensive. Plume's first renderer avoided that by
+rendering each curve into a texture once per sample and sliding it every frame.
+On a 4K laptop that still meant ten ~6 MB off-screen renders per graph per
+second, all landing in the same frame, and they could stall the UI thread.
+0.2 replaces it with a shader:
 
-1. **Per sample** (10 Hz): build the curve as a GskPath and have the GPU render
-   it into a texture slightly wider than the graph.
-2. **Per frame**: emit a clip, a few grid rectangles, and that texture shifted
-   left. The offset snaps to device pixels and the texture is drawn at exactly
-   its own pixel size, so line edges stay crisp instead of being resampled.
-3. **Skip identical frames**: if the snapped offset hasn't changed, nothing is
-   redrawn. On long time scales, new samples only trigger a rebuild once the
-   curve has moved a whole pixel.
-4. **Bound the work**: when a time scale holds more points than the graph has
-   pixel columns, points are thinned to one per column, keeping each column's
-   peak.
+1. **Columns.** History is reduced to one value per *device-pixel column*
+   (`widgets/columns.rs`): interpolated between samples on short time scales,
+   the column maximum on long ones so spikes never vanish, the newest value
+   held at the live edge. Columns live in a ring texture (RGBA32F, 2 rows:
+   values, plus per-column min/max envelopes). A new sample recomputes and
+   uploads only the few dozen columns it touches.
+2. **One draw per frame.** A `GtkGLArea` per graph runs one fragment shader
+   (`widgets/gl.rs`) over a full-screen triangle. The scroll position is a
+   uniform, so each pixel knows its exact sub-pixel data coordinate. Fill
+   coverage comes from the signed distance to the curve, line coverage from
+   the distance to the five nearby segments. Lines are exactly `line_px`
+   device pixels wide at any scroll offset: even motion, no resampling blur.
+3. **Early outs.** The envelope row lets most pixels decide with a single
+   texel fetch whether they're above the curve (draw nothing), deep inside the
+   fill (flat colour) or near the line (exact test).
+4. **Frame skipping.** A graph only re-renders when it moved at least a
+   quarter pixel, its data or axis changed, or the theme changed. The focused
+   window runs at up to 60 fps; floating readouts and background windows at 30.
+5. **One context per window.** All graphs in a window share a GL context
+   (each still renders into its own framebuffer), because a context per graph
+   costs several MB. With a shared context the GL viewport is shared state, so
+   each draw sets its own from the area's tracked framebuffer size.
 
-Lines are straight segments with mitred joins by default, so peaks stay sharp;
-"Smooth curves" switches to a clamped Catmull-Rom spline that never overshoots.
+GL entry points come from libepoxy's dispatch pointers (GTK already loads it),
+so there's no extra dependency, and the same shader body compiles as GLSL 3.30
+core or GLSL ES 3.00. Without OpenGL, the old GskPath-to-texture renderer is
+used automatically. `PLUME_GRAPH=gsk` forces it, for comparison.
 
 ## Only do what's on screen
 
+* Graphs re-render only when they visibly change (see above), at up to 60 fps
+  in the focused window and 30 fps elsewhere. Every frame keeps the GPU awake
+  for a moment, so frame count matters for battery more than per-frame cost.
 * The process scan runs only while a process tab or an inspector is open.
 * `/proc/<pid>/io` (one extra file per process) is read only on the Disk tab.
 * Socket attribution runs only on the Network tab.
@@ -87,15 +109,30 @@ Lines are straight segments with mitred joins by default, so peaks stay sharp;
 ## The process list
 
 The list holds N row objects that never move. Row *i* shows whichever process
-is currently *i*-th in sort order. A refresh rewrites row contents in place and
-touches only visible cells whose text changed, so the scroll position stays put
-and nothing is rebuilt. The selection follows the process, and a PID that gets
-recycled is never mistaken for the process you selected: actions check
+is currently *i*-th in sort order. The selection follows the process, and a
+recycled PID is never mistaken for the process you selected: actions check
 `(pid, start time)` through a pidfd.
 
+GTK keeps about 200 rows bound, far more than are visible. When a busy process
+moves up one rank, every row below it changes content. Notifying all bound
+cells cost 65 ms per refresh with 300 processes, so only rows in (or near) the
+viewport are notified. Off-screen rows are marked stale and flushed when
+scrolling brings them into view. Tooltips are produced on hover rather than
+rebuilt on every update; that alone was most of the per-cell cost.
+
 Alternating row colours are tagged by item position, which is stable in this
-model. CSS `:nth-child` would flicker, because row widgets are recycled while
-scrolling.
+model, on the cell labels. Changing CSS on GTK's own row widgets during bind
+trips an assertion in GTK 4.14's list widget.
+
+## Layout stability
+
+Values update four times a second. A layout that depends on text width (such
+as GtkFlowBox) can then resize or move cards, and any resize changes a graph's
+width and therefore its time scale, which looks like jitter. So the Overview
+uses a container that picks one or two *equal* columns from the available
+width only (`widgets/tiles.rs`). Every value label has a fixed width with
+tabular digits, and stats sit in a fixed 4-column grid. `PLUME_PROFILE=1`
+counts graph resizes, which should stay at 0.
 
 ## GPUs
 
@@ -104,9 +141,16 @@ scrolling.
   and connects to NVML only when the GPU is already awake. It disconnects after
   3 s at 0 % with no GPU processes, so the GPU can power down again. "Asleep"
   in the UI means the GPU is powered down.
-* **Intel:** intel_gpu_top-style engine counters need the perf PMU, which Ubuntu
-  restricts to root. Plume derives `busy ≈ 1 − ΔRC6 / Δt` from the
-  world-readable RC6 residency counter (i915) or the GT idle residency (xe).
+* **Intel:** the kernel's per-client DRM accounting (`/proc/<pid>/fdinfo`, as
+  used by intel_gpu_top and nvtop) gives real engine time without root, at
+  least for the user's own processes, the compositor included. Plume finds DRM
+  file descriptors incrementally (new processes once, known GPU clients every
+  5 s, others every 30 s, within a 2 ms budget), sums engine-time deltas per
+  engine class, and shows the busiest class as utilisation, plus a per-process
+  "% GPU" column. It also still reports `1 − ΔRC6 / Δt` from the RC6 residency
+  counter as "Awake". That is time the GPU spends out of its sleep state;
+  frequent tiny workloads such as 60 fps animation keep it high, so it reads
+  far above engine utilisation (60–70% awake can mean single-digit busy).
 * **AMD:** `gpu_busy_percent`, VRAM and hwmon sensors, also gated on runtime PM.
 
 ## Per-process network
@@ -125,25 +169,41 @@ the socket buffer fills.
 
 ## Measurements
 
-Taken in a 4-vCPU cloud VM with software rendering (llvmpipe):
+Taken in a 4-vCPU cloud VM at 2× scale. This VM has no GPU: Mesa's llvmpipe
+runs all GPU work, including the graph shader and GTK's compositing, on the
+CPU. CPU-side numbers are real; anything labelled "paint" is inflated.
+
+### 0.2 profiling pass (`PLUME_PROFILE=1`)
+
+| | 0.1 | 0.2 |
+|---|---|---|
+| Overview: work per new sample, per graph | 2.7–3.5 ms (path build, render, upload) | 7–10 µs (column update) |
+| Overview: data uploaded to the GPU | several MB/s of textures | 22 KiB/s |
+| Overview: layout phase, p95 / max | 13–19 ms | 0.67 / 1.3 ms |
+| Overview: graph resizes while values change | frequent (content-sized cards) | 0 |
+| CPU tab, 314 processes: list refresh avg / max | 34–60 / 89–213 ms | 0.7–1.1 / 1.1–1.5 ms |
+| CPU tab: first open of a tab | 110–166 ms | 50 ms |
+| Three floating readouts: graph code | 9.3% of a core | 0.65% |
+| Memory with 10 graphs: one context per graph vs per window | — | −65 MB |
+
+The graph shader ran 2,700 µs → 590 µs per draw on llvmpipe after
+specialising it for two series. On a GPU each draw is a few microseconds of
+CPU time.
+
+### Collector
 
 | | cost |
 |---|---|
 | CPU / memory / network / disk sample | 5.6 / 3.8 / 3.6 / 7.6 µs |
 | Process scan, 482 processes | 3.9 ms (≈ 0.4 % of a core at 1 Hz) |
 | Whole sampler, 10 Hz + process scan at 1 Hz | 0.8 % of one core, 4.3 MB RSS |
-| Graph code, Overview with 4 graphs | ≈ 1 % of one core |
-| Graph code, one floating readout at 1 min / 1 h | 1.5 % / 0.18 % |
 | Empty libadwaita window (`examples/baseline.rs`) | 116 MB RSS (Cairo) / 176 MB (llvmpipe) |
-| Plume, Overview tab | 136 MB RSS (Cairo) / 190 MB (llvmpipe) |
 
-Most of the memory figure is GTK, libadwaita and the GL driver. Plume adds about
-15–20 MB on top of an empty window. llvmpipe loads LLVM and runs all GPU work on
-the CPU, so expect lower memory and much lower total CPU on real graphics
-hardware. Measure your own machine:
+Most of the memory figure is GTK, libadwaita and the GL driver. Measure your
+own machine:
 
 ```bash
-PLUME_PROFILE=1 plume                                 # graph-code cost, every 5 s
+PLUME_PROFILE=1 plume                                 # frame pacing + graph cost, every 5 s
 cargo run --release -p plume-core --example bench     # collector cost per sample
 ```
 

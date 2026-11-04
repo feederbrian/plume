@@ -142,6 +142,7 @@ pub fn show_main() {
     }
     let Some(app) = application() else { return };
     let m = build_main(&app);
+    crate::profile::attach(&m.win, "main");
     MAIN.with(|c| c.replace(Some(m.clone())));
     m.win.present();
     update_demand();
@@ -365,7 +366,8 @@ fn setup_actions(app: &adw::Application) {
             .build();
         let cost = with_shared(|s| (s.fast_cost_us, s.proc_stats.elapsed_us, s.proc_stats.processes));
         d.set_debug_info(&format!(
-            "Fast sample: {} µs\nProcess scan: {} µs for {} processes\nGTK {}.{}.{}\nlibadwaita {}.{}.{}\n",
+            "Graph renderer: {}\nFast sample: {} µs\nProcess scan: {} µs for {} processes\nGTK {}.{}.{}\nlibadwaita {}.{}.{}\n",
+            graph::renderer_name(),
             cost.0,
             cost.1,
             cost.2,
@@ -506,9 +508,10 @@ pub fn run() -> glib::ExitCode {
     app.connect_startup(|app| {
         APP.with(|a| a.replace(Some(app.clone())));
         let s = settings::get();
-        graph::set_fps_cap(s.fps_cap);
+        graph::set_fps_caps(s.fps_cap, s.fps_cap_bg);
         graph::set_history_secs(s.history_secs);
         graph::set_smooth(s.smooth);
+        graph::set_line_px(s.line_px as f32);
         theme::apply(&s.theme);
         theme::follow_system();
         let _ = sampler();

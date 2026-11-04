@@ -59,7 +59,7 @@ impl Channel {
     fn columns(self) -> &'static [Col] {
         use Col::*;
         match self {
-            Channel::Cpu => &[Name, Cpu, CpuTime, Threads, Nice, State, Pid, User, Command],
+            Channel::Cpu => &[Name, Cpu, Gpu, CpuTime, Threads, Nice, State, Pid, User, Command],
             Channel::Memory => &[Name, Memory, Resident, Shared, Virtual, Threads, Pid, User, Command],
             Channel::Disk => &[Name, Write, Read, WriteTotal, ReadTotal, Pid, User, Command],
             Channel::Network => &[Name, NetTx, NetRx, NetTxTotal, NetRxTotal, Conns, Pid, User, Command],
@@ -92,6 +92,7 @@ pub struct Row {
     pub read_total: u64,
     pub write_total: u64,
     pub net: Option<plume_core::netproc::ProcNet>,
+    pub gpu: Option<f32>,
     pub threads: u32,
     pub nice: i8,
     pub state: u8,
@@ -107,6 +108,8 @@ mod imp {
     #[derive(Default)]
     pub struct ProcSlot {
         pub row: RefCell<Row>,
+        /// Data changed while off-screen; cells will be refreshed when it scrolls into view.
+        pub stale: Cell<bool>,
     }
 
     #[glib::object_subclass]
@@ -134,10 +137,24 @@ impl ProcSlot {
     pub fn row(&self) -> std::cell::Ref<'_, Row> {
         self.imp().row.borrow()
     }
-    fn set(&self, r: Row) {
+    /// Stores new row data. Cells are notified now if `visible`, otherwise
+    /// the slot is marked stale (GTK keeps ~200 rows bound, far more than are
+    /// on screen; notifying all of them made each refresh cost ~65 ms).
+    fn set(&self, r: Row, visible: bool) {
         let changed = *self.imp().row.borrow() != r;
         if changed {
             self.imp().row.replace(r);
+        }
+        if visible && (changed || self.imp().stale.get()) {
+            self.imp().stale.set(false);
+            self.emit_by_name::<()>("changed", &[]);
+        } else if changed {
+            self.imp().stale.set(true);
+        }
+    }
+
+    fn flush(&self) {
+        if self.imp().stale.replace(false) {
             self.emit_by_name::<()>("changed", &[]);
         }
     }
@@ -148,6 +165,7 @@ enum Col {
     Name,
     User,
     Cpu,
+    Gpu,
     CpuTime,
     Memory,
     Resident,
@@ -169,10 +187,11 @@ enum Col {
     Command,
 }
 
-const ALL_COLS: [Col; 22] = [
+const ALL_COLS: [Col; 23] = [
     Col::Name,
     Col::User,
     Col::Cpu,
+    Col::Gpu,
     Col::CpuTime,
     Col::Memory,
     Col::Resident,
@@ -200,6 +219,7 @@ impl Col {
             Col::Name => "name",
             Col::User => "user",
             Col::Cpu => "cpu",
+            Col::Gpu => "gpu",
             Col::CpuTime => "cputime",
             Col::Memory => "memory",
             Col::Resident => "rss",
@@ -226,6 +246,7 @@ impl Col {
             Col::Name => "Process Name",
             Col::User => "User",
             Col::Cpu => "% CPU",
+            Col::Gpu => "% GPU",
             Col::CpuTime => "CPU Time",
             Col::Memory => "Memory",
             Col::Resident => "Resident",
@@ -271,6 +292,12 @@ impl Col {
                 let v = r.cpu * 100.0 / r.div;
                 if v < 0.05 { "0".into() } else if v < 10.0 { format!("{v:.1}") } else { format!("{v:.0}") }
             }
+            Col::Gpu => match r.gpu {
+                None => "–".into(),
+                Some(g) if g * 100.0 < 0.05 => "0".into(),
+                Some(g) if g * 100.0 < 10.0 => format!("{:.1}", g * 100.0),
+                Some(g) => format!("{:.0}", g * 100.0),
+            },
             Col::CpuTime => format::cpu_time(r.cpu_ticks, app::clock_ticks()),
             Col::Memory => if r.memory == 0 { "–".into() } else { format::bytes(r.memory) },
             Col::Resident => format::bytes(r.rss),
@@ -299,6 +326,7 @@ impl Col {
             Col::Name => cmp_ci(&a.name, &b.name),
             Col::User => a.user.cmp(&b.user),
             Col::Cpu => a.cpu.total_cmp(&b.cpu),
+            Col::Gpu => f(a.gpu).total_cmp(&f(b.gpu)),
             Col::CpuTime => a.cpu_ticks.cmp(&b.cpu_ticks),
             Col::Memory => a.memory.cmp(&b.memory),
             Col::Resident => a.rss.cmp(&b.rss),
@@ -478,8 +506,13 @@ pub fn actions() -> gio::SimpleActionGroup {
 struct Table {
     channel: Channel,
     store: gio::ListStore,
+    /// Mirror of the store's items (avoids a GObject lookup per row).
+    slots: RefCell<Vec<ProcSlot>>,
     selection: gtk::SingleSelection,
     view: gtk::ColumnView,
+    scroller: gtk::ScrolledWindow,
+    /// The % GPU column, hidden where DRM engine accounting isn't available.
+    gpu_col: Option<gtk::ColumnViewColumn>,
     menu: gtk::PopoverMenu,
     updating: Cell<bool>,
     last_gen: Cell<u64>,
@@ -539,8 +572,11 @@ pub fn page(channel: Channel) -> gtk::Box {
     let t = Rc::new(Table {
         channel,
         store,
+        slots: RefCell::new(Vec::new()),
         selection,
         view,
+        scroller: scroller.clone(),
+        gpu_col: columns.iter().find(|(c, _)| *c == Col::Gpu).map(|(_, c)| c.clone()),
         menu,
         updating: Cell::new(false),
         last_gen: Cell::new(u64::MAX),
@@ -548,6 +584,22 @@ pub fn page(channel: Channel) -> gtk::Box {
     });
     state().tables.borrow_mut().push(Rc::downgrade(&t));
     wire(&t, &columns);
+    {
+        let weak = Rc::downgrade(&t);
+        let adj = t.scroller.vadjustment();
+        let flush = move || {
+            if let Some(t) = weak.upgrade() {
+                let (a, b) = visible_range(&t);
+                let slots = t.slots.borrow();
+                for s in slots.iter().take(b + 1).skip(a) {
+                    s.flush();
+                }
+            }
+        };
+        let f2 = flush.clone();
+        adj.connect_value_changed(move |_| flush());
+        adj.connect_page_size_notify(move |_| f2());
+    }
 
     // Poll for new data only while this tab is visible.
     let timer: Rc<RefCell<Option<glib::SourceId>>> = Rc::default();
@@ -600,6 +652,20 @@ fn cell_factory(col: Col) -> gtk::SignalListItemFactory {
         let item = obj.downcast_ref::<gtk::ListItem>().unwrap();
         let l = gtk::Label::new(None);
         l.add_css_class("plume-cell");
+        if matches!(col, Col::Name | Col::Command) {
+            // Tooltips are produced on hover instead of on every update.
+            l.set_has_tooltip(true);
+            l.connect_query_tooltip(|l, _, _, _, tip| {
+                let data = unsafe { l.data::<(glib::WeakRef<ProcSlot>, glib::SignalHandlerId)>("plume-slot") };
+                let Some(slot) = data.and_then(|d| unsafe { d.as_ref() }.0.upgrade()) else { return false };
+                let r = slot.row();
+                if r.cmdline.is_empty() {
+                    return false;
+                }
+                tip.set_text(Some(&r.cmdline));
+                true
+            });
+        }
         l.set_xalign(if col.numeric() { 1.0 } else { 0.0 });
         l.set_ellipsize(if col == Col::Command {
             gtk::pango::EllipsizeMode::End
@@ -615,6 +681,10 @@ fn cell_factory(col: Col) -> gtk::SignalListItemFactory {
         let item = obj.downcast_ref::<gtk::ListItem>().unwrap();
         let Some(label) = item.child().and_downcast::<gtk::Label>() else { return };
         let Some(slot) = item.item().and_downcast::<ProcSlot>() else { return };
+        RENDERS.with(|r| {
+            let (n, us, b) = r.get();
+            r.set((n, us, b + 1));
+        });
         render(&label, col, &slot);
         stripe(&label, item.position());
         let weak = label.downgrade();
@@ -754,15 +824,29 @@ fn wire(t: &Rc<Table>, columns: &[(Col, gtk::ColumnViewColumn)]) {
     t.view.add_controller(sc);
 }
 
+thread_local! {
+    static RENDERS: Cell<(u32, i64, u32)> = const { Cell::new((0, 0, 0)) };
+}
+
 fn render(label: &gtk::Label, col: Col, slot: &ProcSlot) {
+    if !crate::profile::enabled() {
+        return render_inner(label, col, slot);
+    }
+    let t0 = glib::monotonic_time();
+    render_inner(label, col, slot);
+    RENDERS.with(|r| {
+        let (n, us, binds) = r.get();
+        r.set((n + 1, us + glib::monotonic_time() - t0, binds));
+    });
+}
+
+fn render_inner(label: &gtk::Label, col: Col, slot: &ProcSlot) {
     let r = slot.row();
     let text = col.text(&r);
     if label.text() != text {
         label.set_text(&text);
     }
-    if col == Col::Command || col == Col::Name {
-        label.set_tooltip_text(if r.cmdline.is_empty() { None } else { Some(&r.cmdline) });
-    }
+    let _ = col;
 }
 
 fn slot_at(view: &gtk::ColumnView, x: f64, y: f64) -> Option<ProcSlot> {
@@ -782,10 +866,46 @@ fn slot_at(view: &gtk::ColumnView, x: f64, y: f64) -> Option<ProcSlot> {
     }
 }
 
+thread_local! {
+    static REFRESH_PROF: Cell<(i64, u32, i64, i64)> = const { Cell::new((0, 0, 0, 0)) };
+}
+
 fn refresh(t: &Rc<Table>, force: bool) {
     let (procs, gen, ncpu) = app::with_shared(|s| (s.procs.clone(), s.procs_gen, s.info.cpu.logical));
     if !force && gen == t.last_gen.get() {
         return;
+    }
+    let t0 = glib::monotonic_time();
+    refresh_inner(t, procs, gen, ncpu);
+    if crate::profile::enabled() {
+        REFRESH_PROF.with(|c| {
+            let now = glib::monotonic_time();
+            let (start, n, sum, max) = c.get();
+            let d = now - t0;
+            let (start, n, sum, max) = if start == 0 { (now, 1, d, d) } else { (start, n + 1, sum + d, max.max(d)) };
+            if now - start >= 5_000_000 {
+                eprintln!(
+                    "plume-procs: {} refreshes ({} rows), avg {:.2} ms, max {:.2} ms",
+                    n,
+                    t.store.n_items(),
+                    sum as f64 / n as f64 / 1000.0,
+                    max as f64 / 1000.0
+                );
+                c.set((now, 0, 0, 0));
+            } else {
+                c.set((start, n, sum, max));
+            }
+        });
+    }
+}
+
+fn refresh_inner(t: &Rc<Table>, procs: std::sync::Arc<Vec<ProcInfo>>, gen: u64, ncpu: usize) {
+    let t_begin = glib::monotonic_time();
+    if let Some(c) = &t.gpu_col {
+        let on = app::with_shared(|s| s.gpu_procs);
+        if c.is_visible() != on {
+            c.set_visible(on);
+        }
     }
     t.last_gen.set(gen);
     let st = state();
@@ -823,24 +943,32 @@ fn refresh(t: &Rc<Table>, force: bool) {
         if desc { o.reverse() } else { o }
     });
 
+    let t_sorted = glib::monotonic_time();
     let n_old = t.store.n_items() as usize;
     let n_new = v.len();
     t.updating.set(true);
+    let t_model0 = glib::monotonic_time();
+    let (va, vb) = visible_range(t);
     if n_new > n_old {
         let add: Vec<ProcSlot> = (n_old..n_new).map(|_| ProcSlot::new()).collect();
         for (slot, p) in add.iter().zip(&v[n_old..]) {
-            slot.set(row_of(p, div));
+            slot.set(row_of(p, div), false);
         }
         t.store.extend_from_slice(&add);
+        t.slots.borrow_mut().extend(add);
     } else if n_new < n_old {
         t.store.splice(n_new as u32, (n_old - n_new) as u32, &[] as &[ProcSlot]);
+        t.slots.borrow_mut().truncate(n_new);
     }
-    for (k, p) in v.iter().enumerate().take(n_old.min(n_new)) {
-        if let Some(slot) = t.store.item(k as u32).and_downcast::<ProcSlot>() {
-            slot.set(row_of(p, div));
+    let t_model = glib::monotonic_time() - t_model0;
+    {
+        let slots = t.slots.borrow();
+        for (k, (p, slot)) in v.iter().zip(slots.iter()).enumerate().take(n_old.min(n_new)) {
+            slot.set(row_of(p, div), k >= va && k <= vb);
         }
     }
 
+    let t_slots = glib::monotonic_time();
     // Keep the (shared) selection on the same process.
     if let Some((pid, start)) = st.selected.get() {
         match v.iter().position(|p| p.pid == pid && p.start_ticks == start) {
@@ -858,6 +986,31 @@ fn refresh(t: &Rc<Table>, force: bool) {
     }
     t.updating.set(false);
     update_end_button();
+    if std::env::var_os("PLUME_PROFILE_PROCS").is_some() {
+        let (nr, rus, nb) = RENDERS.with(|r| r.replace((0, 0, 0)));
+        eprintln!(
+            "plume-procs-detail: {nr} cell renders ({:.2} ms), {nb} binds | rows {n_old}->{n_new}, model change {:.2} ms, sort {:.2} ms, slots {:.2} ms, select {:.2} ms",
+            rus as f64 / 1000.0,
+            t_model as f64 / 1000.0,
+            (t_sorted - t_begin) as f64 / 1000.0,
+            (t_slots - t_sorted) as f64 / 1000.0,
+            (glib::monotonic_time() - t_slots) as f64 / 1000.0
+        );
+    }
+}
+
+/// Slot indices on (or near) screen, from the scroll position. Rows have a
+/// uniform height, so the adjustment gives it directly.
+fn visible_range(t: &Table) -> (usize, usize) {
+    let n = t.slots.borrow().len();
+    if n == 0 {
+        return (0, 0);
+    }
+    let adj = t.scroller.vadjustment();
+    let row_h = (adj.upper() / n as f64).max(1.0);
+    let first = (adj.value() / row_h).floor() as i64 - 6;
+    let last = ((adj.value() + adj.page_size()) / row_h).ceil() as i64 + 6;
+    (first.max(0) as usize, (last.max(0) as usize).min(n - 1))
 }
 
 fn row_of(p: &ProcInfo, div: f32) -> Row {
@@ -877,6 +1030,7 @@ fn row_of(p: &ProcInfo, div: f32) -> Row {
         read_total: p.read_total,
         write_total: p.write_total,
         net: p.net,
+        gpu: p.gpu,
         threads: p.threads,
         nice: p.nice,
         state: p.state,

@@ -14,6 +14,12 @@ pub struct Settings {
     pub history_secs: u32,
     /// 0 = follow the display refresh rate.
     pub fps_cap: u32,
+    /// Frame rate for unfocused windows and floating readouts.
+    pub fps_cap_bg: u32,
+    /// Graph line width in device pixels.
+    pub line_px: f64,
+    /// True-black backgrounds for dark themes (OLED panels).
+    pub oled: bool,
     pub smooth: bool,
     pub cpu_per_core: bool,
     pub divide_cpu: bool,
@@ -39,6 +45,9 @@ impl Default for Settings {
             proc_interval_ms: 1000,
             history_secs: 60,
             fps_cap: 60,
+            fps_cap_bg: 30,
+            line_px: 1.5,
+            oled: false,
             smooth: false,
             cpu_per_core: false,
             divide_cpu: true,
@@ -81,6 +90,9 @@ fn load() -> Settings {
     if let Some(v) = int("proc_interval_ms") { s.proc_interval_ms = v.clamp(250, 10_000) as u64; }
     if let Some(v) = int("history_secs") { s.history_secs = v.clamp(10, 3600) as u32; }
     if let Some(v) = int("fps_cap") { s.fps_cap = v.clamp(0, 240) as u32; }
+    if let Some(v) = int("fps_cap_bg") { s.fps_cap_bg = v.clamp(0, 240) as u32; }
+    if let Some(v) = dbl("line_px") { s.line_px = v.clamp(0.5, 6.0); }
+    if let Some(v) = boo("oled") { s.oled = v; }
     if let Some(v) = boo("smooth") { s.smooth = v; }
     if let Some(v) = boo("cpu_per_core") { s.cpu_per_core = v; }
     if let Some(v) = boo("divide_cpu") { s.divide_cpu = v; }
@@ -125,6 +137,9 @@ fn save(s: &Settings) {
     kf.set_integer(G, "proc_interval_ms", s.proc_interval_ms as i32);
     kf.set_integer(G, "history_secs", s.history_secs as i32);
     kf.set_integer(G, "fps_cap", s.fps_cap as i32);
+    kf.set_integer(G, "fps_cap_bg", s.fps_cap_bg as i32);
+    kf.set_double(G, "line_px", s.line_px);
+    kf.set_boolean(G, "oled", s.oled);
     kf.set_boolean(G, "smooth", s.smooth);
     kf.set_boolean(G, "cpu_per_core", s.cpu_per_core);
     kf.set_boolean(G, "divide_cpu", s.divide_cpu);

@@ -14,6 +14,23 @@ use std::rc::Rc;
 
 type Updater = Box<dyn Fn(&Shared)>;
 
+/// "render" → "Render", "video-enhance" → "Video enhance", xe "rcs" → "Render".
+fn engine_name(e: &str) -> String {
+    let e = match e {
+        "rcs" | "gfx" => "render",
+        "bcs" => "copy",
+        "vcs" | "dec" => "video",
+        "vecs" => "video-enhance",
+        "ccs" | "compute" => "compute",
+        other => other,
+    };
+    let mut s = e.replace('-', " ");
+    if let Some(c) = s.get_mut(0..1) {
+        c.make_ascii_uppercase();
+    }
+    s
+}
+
 /// 1-second mean of a history series (falls back to the instant value).
 fn avg(series: &plume_core::history::Series, instant: f64) -> f64 {
     series.mean_recent(1_000_000).map(|v| v as f64).unwrap_or(instant)
@@ -23,30 +40,20 @@ pub fn build() -> gtk::Widget {
     let (info, n_cores) = crate::app::with_shared(|s| (s.info.clone(), s.hist.cores.len()));
     let mut updaters: Vec<Updater> = Vec::new();
 
-    let flow = gtk::FlowBox::new();
-    flow.set_selection_mode(gtk::SelectionMode::None);
-    flow.set_homogeneous(false);
-    flow.set_min_children_per_line(1);
-    flow.set_max_children_per_line(2);
-    flow.set_column_spacing(12);
-    flow.set_row_spacing(12);
+    // Two equal columns when there is room for two 420 px cards, else one;
+    // never decided by content, so updating values can't reflow the page.
+    let flow = crate::widgets::tiles::Tiles::new(420, 12);
     flow.set_valign(gtk::Align::Start);
     flow.set_margin_top(12);
     flow.set_margin_bottom(12);
     flow.set_margin_start(12);
     flow.set_margin_end(12);
 
-    let add = |w: &gtk::Box| {
-        w.set_size_request(400, -1);
-        let child = gtk::FlowBoxChild::new();
-        child.set_child(Some(w));
-        child.set_focusable(false);
-        flow.append(&child);
-    };
+    let add = |w: &gtk::Box| flow.append(w);
 
     // ---------------------------------------------------------------- CPU
     {
-        let c = card("CPU", Some("cpu"));
+        let c = card("CPU", Some("cpu"), 6);
         c.sub.set_text(&format!(
             "{} · {} cores, {} threads",
             info.cpu.model, info.cpu.physical, info.cpu.logical
@@ -146,7 +153,7 @@ pub fn build() -> gtk::Widget {
 
     // ------------------------------------------------------------- Memory
     {
-        let c = card("Memory", Some("mem"));
+        let c = card("Memory", Some("mem"), 6);
         let g = Graph::new(
             &[
                 Line { key: Key::Mem, color: Color::Mem, fill: true },
@@ -184,7 +191,7 @@ pub fn build() -> gtk::Widget {
 
     // --------------------------------------------------------------- GPUs
     for (i, gi) in info.gpus.iter().enumerate() {
-        let c = card(&format!("GPU {i}"), Some(&format!("gpu{i}")));
+        let c = card(&format!("GPU {i}"), Some(&format!("gpu{i}")), 7);
         let kind = if gi.integrated { "Integrated" } else { "Discrete" };
         c.sub.set_text(&format!("{} · {kind}", gi.name));
         let mut lines = vec![Line { key: Key::GpuBusy(i), color: Color::Gpu, fill: true }];
@@ -201,6 +208,15 @@ pub fn build() -> gtk::Widget {
         let vram = (!gi.integrated).then(|| stat(&c, "Video memory", Some("plume-sw-mem")));
         let temp = (gi.vendor != Vendor::Intel).then(|| stat(&c, "Temperature", None));
         let power = (gi.vendor != Vendor::Intel).then(|| stat(&c, "Power", None));
+        // Intel: real engine time (DRM fdinfo) next to time out of RC6 sleep.
+        let engines = (gi.vendor == Vendor::Intel).then(|| stat(&c, "Engines", None));
+        let awake = (gi.vendor == Vendor::Intel).then(|| stat(&c, "Awake", None));
+        if let Some(a) = &awake {
+            a.set_tooltip_text(Some(
+                "Share of time the GPU is out of its RC6 sleep state. Every frame anything \
+                 draws wakes it briefly, so this reads much higher than engine utilization.",
+            ));
+        }
         let drv = stat(&c, "Driver", None);
         drv.set_text(&gi.driver);
         drv.set_tooltip_text(Some(&format!("Utilization source: {}", gi.busy_source)));
@@ -239,6 +255,22 @@ pub fn build() -> gtk::Widget {
                     _ => card::set(l, "–"),
                 }
             }
+            if let Some(l) = &engines {
+                let txt = if g.engines.is_empty() {
+                    "–".to_string()
+                } else {
+                    g.engines
+                        .iter()
+                        .filter(|(_, f)| *f > 0.0005 || g.engines.len() <= 2)
+                        .map(|(e, f)| format!("{} {}", engine_name(e), format::percent(*f)))
+                        .collect::<Vec<_>>()
+                        .join(" · ")
+                };
+                card::set_with_tip(l, if txt.is_empty() { "Idle" } else { &txt });
+            }
+            if let Some(l) = &awake {
+                card::set(l, &g.awake.map(format::percent).unwrap_or_else(|| "–".into()));
+            }
             if let Some(l) = &temp {
                 card::set(l, &g.temp_c.map(|t| format!("{t:.0} °C")).unwrap_or_else(|| "–".into()));
             }
@@ -251,7 +283,7 @@ pub fn build() -> gtk::Widget {
 
     // ------------------------------------------------------------ Network
     {
-        let c = card("Network", Some("net"));
+        let c = card("Network", Some("net"), 24);
         let g = Graph::new(
             &[
                 Line { key: Key::NetRx, color: Color::Rx, fill: true },
@@ -284,15 +316,15 @@ pub fn build() -> gtk::Widget {
                 .map(|i| if i.wireless { format!("{} (Wi-Fi)", i.name) } else { i.name.clone() })
                 .collect();
             let names = if names.is_empty() { "None".to_string() } else { names.join(", ") };
-            card::set(&ifaces, &names);
-            card::set(&sub, &names);
+            card::set_with_tip(&ifaces, &names);
+            card::set_with_tip(&sub, &names);
         }));
         add(&c.root);
     }
 
     // --------------------------------------------------------------- Disk
     {
-        let c = card("Disk", Some("disk"));
+        let c = card("Disk", Some("disk"), 24);
         let g = Graph::new(
             &[
                 Line { key: Key::DiskRead, color: Color::Read, fill: true },
@@ -323,13 +355,13 @@ pub fn build() -> gtk::Widget {
             card::set(&write, &format::rate(wr));
             card::set(&busy, &format::percent(d.busy));
             let names: Vec<String> = d.disks.iter().map(|x| x.name.clone()).collect();
-            card::set(&devs, &names.join(", "));
+            card::set_with_tip(&devs, &names.join(", "));
             let models: Vec<String> = d
                 .disks
                 .iter()
                 .map(|x| if x.model.is_empty() { x.name.clone() } else { format!("{} ({})", x.model, format::bytes(x.size)) })
                 .collect();
-            card::set(&sub, &models.join(" · "));
+            card::set_with_tip(&sub, &models.join(" · "));
 
             // Filesystems: rebuild rows only when the mount set changes.
             let mut rows = fs_rows.borrow_mut();
@@ -354,6 +386,8 @@ pub fn build() -> gtk::Widget {
                     let lbl = gtk::Label::new(None);
                     lbl.add_css_class("plume-num");
                     lbl.add_css_class("plume-cap");
+                    lbl.set_xalign(1.0);
+                    lbl.set_width_chars(26);
                     line.append(&name);
                     line.append(&bar);
                     line.append(&lbl);

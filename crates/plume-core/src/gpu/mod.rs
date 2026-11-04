@@ -8,6 +8,7 @@
 //! only touch the driver when the GPU is already awake.
 
 pub mod amd;
+pub mod drm;
 pub mod intel;
 pub mod nvidia;
 mod pciids;
@@ -56,6 +57,11 @@ pub struct GpuSample {
     pub power_w: Option<f32>,
     /// False while we deliberately stop polling so the GPU can power down.
     pub polled: bool,
+    /// Intel: share of time out of RC6 sleep ("awake"), which overstates
+    /// load at steady low activity; `busy` prefers real engine time.
+    pub awake: Option<f32>,
+    /// Per-engine-class busy fractions from DRM fdinfo, when available.
+    pub engines: Vec<(String, f32)>,
     /// Name reported by the driver, if better than the PCI database's.
     pub driver_name: Option<String>,
 }

@@ -48,6 +48,8 @@ pub struct ProcInfo {
     pub kernel_thread: bool,
     /// Per-process TCP throughput; `None` when not measured or not ours to see.
     pub net: Option<crate::netproc::ProcNet>,
+    /// Share of one GPU engine (busiest class) from DRM fdinfo; `None` if unknown.
+    pub gpu: Option<f32>,
 }
 
 struct Entry {
@@ -234,6 +236,7 @@ fn scan_one(
             write_total: carry.as_ref().map_or(0, |c| c.info.write_total),
             kernel_thread,
             net: None,
+            gpu: None,
         };
         entries.entry(pid).or_insert(Entry { info, comm, comm_len: cl as u8, seen: gen, io_denied: false })
     } else {

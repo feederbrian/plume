@@ -107,6 +107,10 @@ pub fn open(id: &str) {
     let value = gtk::Label::new(None);
     value.add_css_class("plume-float-value");
     value.set_halign(gtk::Align::End);
+    value.set_xalign(1.0);
+    crate::widgets::card::fixed_width(&value, 16);
+    title.set_ellipsize(gtk::pango::EllipsizeMode::End);
+    title.set_width_chars(1);
     let header = gtk::Box::new(gtk::Orientation::Horizontal, 6);
     header.append(&title);
     header.append(&value);
@@ -259,6 +263,7 @@ pub fn open(id: &str) {
     });
     win.connect_suspended_notify(|_| app::update_demand());
 
+    crate::profile::attach(&win, &format!("float {id}"));
     OPEN.with(|o| o.borrow_mut().insert(id.to_string(), win.clone()));
     remember();
     win.present();

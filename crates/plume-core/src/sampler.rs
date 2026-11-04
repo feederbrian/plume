@@ -74,6 +74,10 @@ pub struct Shared {
     pub psi: [f32; 3],
     /// Whether per-process network figures are being collected.
     pub net_procs: bool,
+    /// GPU engine share per pid (DRM fdinfo), refreshed by the fast thread.
+    pub gpu_by_pid: std::collections::HashMap<i32, f32>,
+    /// True once DRM fdinfo engine accounting has produced data.
+    pub gpu_procs: bool,
     pub procs: Arc<Vec<ProcInfo>>,
     pub procs_gen: u64,
     pub proc_stats: ScanStats,
@@ -274,6 +278,11 @@ fn fast_loop(shared: Arc<Mutex<Shared>>, ctl: Arc<Control>, mut cpu: CpuReader, 
     let mut ns = NetSample::default();
     let mut ds = DiskSample::default();
     let mut gs: Vec<GpuSample> = vec![GpuSample::default(); gpus.len()];
+    // Real engine utilisation for DRM-driver GPUs (i915, xe, amdgpu).
+    let mut drm = gpus
+        .iter()
+        .any(|(_, g)| matches!(g.info.driver.as_str(), "i915" | "xe" | "amdgpu"))
+        .then(crate::gpu::drm::DrmScanner::new);
     let mut freq = Vec::new();
     let mut tick: u64 = 0;
     let mut next = now_us();
@@ -285,6 +294,20 @@ fn fast_loop(shared: Arc<Mutex<Shared>>, ctl: Arc<Control>, mut cpu: CpuReader, 
         let have_disk = disk.sample(t, &mut ds);
         for ((_, g), s) in gpus.iter_mut().zip(gs.iter_mut()) {
             g.sample(t, s);
+        }
+        let mut gpu_pids = None;
+        if let Some(d) = drm.as_mut() {
+            let (devs, pids) = d.sample();
+            for ((_, g), s) in gpus.iter().zip(gs.iter_mut()) {
+                match devs.get(&g.info.pci_addr) {
+                    Some(u) if s.power != crate::gpu::PowerState::Suspended => {
+                        s.busy = Some(u.busy);
+                        s.engines.clone_from(&u.engines);
+                    }
+                    _ => s.engines.clear(),
+                }
+            }
+            gpu_pids = Some(pids);
         }
         // Slow-changing values at ~2 Hz / ~1 Hz.
         let interval = ctl.fast_interval_us.load(Ordering::Relaxed).max(1);
@@ -349,6 +372,10 @@ fn fast_loop(shared: Arc<Mutex<Shared>>, ctl: Arc<Control>, mut cpu: CpuReader, 
                     }
                 }
                 s.gpus[*i].clone_from(g);
+            }
+            if let Some(p) = gpu_pids.take() {
+                s.gpu_procs = true;
+                s.gpu_by_pid = p;
             }
             if have_cpu {
                 s.cpu.clone_from(&cs);
@@ -440,6 +467,11 @@ fn slow_loop(shared: Arc<Mutex<Shared>>, ctl: Arc<Control>, mut gpus: Vec<(usize
         {
             let mut guard = shared.lock().unwrap_or_else(|e| e.into_inner());
             let s = &mut *guard;
+            if stats.is_some() && s.gpu_procs {
+                for p in procs.iter_mut() {
+                    p.gpu = Some(s.gpu_by_pid.get(&p.pid).copied().unwrap_or(0.0));
+                }
+            }
             for ((i, _), g) in gpus.iter().zip(gs.iter()) {
                 if let Some(b) = g.busy {
                     s.hist.gpu_busy[*i].push(t, b);

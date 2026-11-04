@@ -39,7 +39,8 @@ fn kv(g: &gtk::Grid, row: i32, caption: &str, swatch: Option<&str>) -> gtk::Labe
     cap_box.append(&cap);
     let v = gtk::Label::new(Some("–"));
     v.set_xalign(1.0);
-    v.set_width_chars(10);
+    // Fixed width: a changing value must never resize the graph next to it.
+    crate::widgets::card::fixed_width(&v, 15);
     v.add_css_class("plume-statval");
     g.attach(&cap_box, 0, row, 1, 1);
     g.attach(&v, 1, row, 1, 1);
@@ -216,7 +217,7 @@ pub fn build(ch: Channel) -> (gtk::Widget, Updater) {
                 set(&tin, &format::bytes(n.rx_total));
                 set(&tout, &format::bytes(n.tx_total));
                 let names: Vec<&str> = n.interfaces.iter().filter(|i| i.physical).map(|i| i.name.as_str()).collect();
-                set(&ifs, &if names.is_empty() { "None".into() } else { names.join(", ") });
+                crate::widgets::card::set_with_tip(&ifs, &if names.is_empty() { "None".into() } else { names.join(", ") });
             })
         }
     };
