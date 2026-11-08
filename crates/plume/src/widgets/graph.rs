@@ -120,6 +120,71 @@ thread_local! {
     static LINE_PX: Cell<f32> = const { Cell::new(1.5) };
     /// Bumped when any of the above changes, so graphs re-render.
     static CFG_GEN: Cell<u64> = const { Cell::new(1) };
+    static OPTS: Cell<RenderOpts> = const { Cell::new(RenderOpts::DEFAULT) };
+    /// Debugging aid: graphs stop scrolling at this display time (µs).
+    static FREEZE_US: Cell<i64> = const { Cell::new(i64::MAX) };
+    /// Graph draws so far (for `plume --bench`).
+    static DRAWS: Cell<u64> = const { Cell::new(0) };
+}
+
+pub fn draw_count() -> u64 {
+    DRAWS.with(Cell::get)
+}
+
+/// How the GL renderer spends GPU time. The defaults are the efficient path;
+/// `plume --bench` measures them against the 0.2.0–0.2.1 behaviour.
+#[derive(Clone, Copy, Debug, PartialEq)]
+pub struct RenderOpts {
+    /// Shade only a strip under the curves (else every pixel, as in 0.2.0–0.2.1).
+    pub strip: bool,
+    /// Skip graphs that are scrolled out of view.
+    pub cull: bool,
+    /// Scrolling redraws once a graph has moved about this many device pixels,
+    /// on a frame grid shared by the whole window (0.25 = nearly every frame).
+    pub step_px: f32,
+}
+
+impl RenderOpts {
+    pub const DEFAULT: RenderOpts = RenderOpts { strip: true, cull: true, step_px: 1.0 };
+}
+
+pub fn set_render_opts(o: RenderOpts) {
+    OPTS.with(|c| c.set(o));
+    bump();
+}
+
+pub fn render_opts() -> RenderOpts {
+    OPTS.with(Cell::get)
+}
+
+/// Scroll step between redraws, device px (Preferences → Graph motion).
+pub fn set_motion_step(px: f32) {
+    OPTS.with(|c| c.set(RenderOpts { step_px: px.clamp(0.1, 8.0), ..c.get() }));
+    bump();
+}
+
+/// Stops (Some) or resumes (None) scrolling at a display time, for comparing
+/// renderers on identical frames.
+pub fn freeze_at(t: Option<i64>) {
+    FREEZE_US.with(|c| c.set(t.unwrap_or(i64::MAX)));
+    bump();
+}
+
+/// Smallest power of two ≥ n (n ≥ 1).
+fn pow2_at_least(n: i64) -> i64 {
+    (n.max(1) as u64).next_power_of_two() as i64
+}
+
+/// Frames per scroll redraw: the largest power of two (≤ 64) that keeps each
+/// step within `step_px`, but at least what the frame-rate cap requires.
+/// Powers of two keep every graph of a window on one shared frame grid, so the
+/// window as a whole redraws at the lower rate too.
+fn frames_per_redraw(px_per_frame: f64, step_px: f64, k_cap: i64) -> i64 {
+    let mut k = 1;
+    while k < 64 && (2 * k) as f64 * px_per_frame <= step_px + 1e-9 {
+        k *= 2;
+    }
+    k.max(k_cap)
 }
 
 fn bump() {
@@ -244,7 +309,7 @@ enum Backend {
 
 #[derive(Default)]
 struct GlRes {
-    prog: Option<gl::Program>,
+    prog: Option<gl::Programs>,
     tex: u32,
     vao: u32,
     tex_alloc: usize,
@@ -252,7 +317,7 @@ struct GlRes {
 
 thread_local! {
     /// Programs are shared objects, so one link serves every GL area.
-    static SHARED_PROG: Cell<Option<gl::Program>> = const { Cell::new(None) };
+    static SHARED_PROG: Cell<Option<gl::Programs>> = const { Cell::new(None) };
     static GL_WARNED: Cell<bool> = const { Cell::new(false) };
     static RENDERER: Cell<&'static str> = const { Cell::new("not started") };
     /// One GL context per window, shared by all of its graphs (each graph still
@@ -305,7 +370,10 @@ mod imp {
         /// Absolute column coordinate of the right edge for this frame.
         u0: Cell<f64>,
         last_u0: Cell<f64>,
-        last_render: Cell<i64>,
+        /// Frame index of the last scroll redraw (see frames_per_redraw).
+        last_render_n: Cell<i64>,
+        /// Was scrolled out of view at the last tick.
+        hidden: Cell<bool>,
         rendered_cfg: Cell<(u64, u64)>,
         fbo: Cell<(i32, i32)>,
         dev_scale: Cell<f64>,
@@ -355,7 +423,9 @@ mod imp {
         fn map(&self) {
             self.parent_map();
             let id = self.obj().add_tick_callback(|w, clock| {
-                w.imp().on_tick(clock.frame_time());
+                let t = clock.frame_time();
+                let refresh = clock.refresh_info(t).0;
+                w.imp().on_tick(t, if refresh > 1000 { refresh } else { 16_667 });
                 glib::ControlFlow::Continue
             });
             self.tick.replace(Some(id));
@@ -505,8 +575,8 @@ mod imp {
             RENDERER.with(|r| r.set(if gles { "OpenGL ES (shader)" } else { "OpenGL (shader)" }));
             // Reuse the shared program if it is valid in this context's share group.
             let prog = match SHARED_PROG.with(Cell::get) {
-                Some(p) if unsafe { (g.is_program())(p.id) } != 0 => p,
-                _ => match gl::build_program(g, gles) {
+                Some(p) if unsafe { (g.is_program())(p.full.id) } != 0 => p,
+                _ => match gl::build_programs(g, gles) {
                     Ok(p) => {
                         SHARED_PROG.with(|c| c.set(Some(p)));
                         p
@@ -554,11 +624,12 @@ mod imp {
         // Per frame
         // ------------------------------------------------------------------
 
-        fn on_tick(&self, frame_us: i64) {
+        fn on_tick(&self, frame_us: i64, refresh: i64) {
             let focused = self.obj().root().and_downcast::<gtk::Window>().is_some_and(|w| w.is_active());
             let cap = if focused { MIN_FRAME_FG.with(Cell::get) } else { MIN_FRAME_BG.with(Cell::get) };
             let last = self.last_frame.get();
-            if cap > 0 && frame_us - last < cap {
+            // The GL path paces its redraws itself, on a frame grid (gl_tick).
+            if self.backend.get() != Backend::Gl && cap > 0 && frame_us - last < cap {
                 return;
             }
             self.last_frame.set(frame_us);
@@ -570,7 +641,10 @@ mod imp {
                 prof_add(|p| p.resizes += 1);
             }
             match self.backend.get() {
-                Backend::Gl => self.gl_tick(frame_us, dt_frame),
+                Backend::Gl => {
+                    let k_cap = if cap > 0 { pow2_at_least((cap + 1_500 + refresh - 1) / refresh) } else { 1 };
+                    self.gl_tick(frame_us, dt_frame, refresh, k_cap);
+                }
                 Backend::Gsk => {
                     if let Some(b) = self.gsk_tick(frame_us) {
                         prof_add(|p| {
@@ -618,12 +692,27 @@ mod imp {
             (changed, interval)
         }
 
-        fn gl_tick(&self, frame_us: i64, dt_frame: i64) {
+        /// Whether any part of the graph is inside its scrolled window's view.
+        fn in_view(&self) -> bool {
+            let obj = self.obj();
+            let Some(sw) = obj.ancestor(gtk::ScrolledWindow::static_type()) else { return true };
+            let Some(b) = obj.compute_bounds(&sw) else { return true };
+            b.x() < sw.width() as f32 && b.y() < sw.height() as f32 && b.x() + b.width() > 0.0 && b.y() + b.height() > 0.0
+        }
+
+        fn gl_tick(&self, frame_us: i64, dt_frame: i64, refresh: i64, k_cap: i64) {
             let obj = self.obj();
             let (w, h) = (obj.width(), obj.height());
             if w <= 1 || h <= 1 {
                 return;
             }
+            let opts = OPTS.with(Cell::get);
+            // Off-screen in a scrolled window: no work at all until it is back.
+            if opts.cull && !self.in_view() {
+                self.hidden.set(true);
+                return;
+            }
+            let reappeared = self.hidden.replace(false);
             let scale = obj.native().and_then(|n| n.surface()).map(|s| s.scale()).unwrap_or(1.0);
             // Use the real framebuffer size once known (GTK may round differently).
             let (fw, fh) = self.fbo.get();
@@ -633,7 +722,7 @@ mod imp {
             let window = self.window_us().max(1_000_000);
             let (data_changed, interval) = self.poll_data();
             let delay = self.delay.get();
-            let disp = frame_us - delay;
+            let disp = (frame_us - delay).min(FREEZE_US.with(Cell::get));
             self.disp.set(disp);
             let dt = window as f64 / wdev as f64;
             let u0 = disp as f64 / dt;
@@ -714,20 +803,27 @@ mod imp {
                 self.ymax.set(1.0);
             }
 
-            // Render only if something visibly changed.
+            // Render only if something visibly changed. Scrolling and new data
+            // redraw on the first frame of each block of k frames: every graph of
+            // the window uses the same frame index and power-of-two blocks, so
+            // the window (and the compositor) also redraws only on those frames,
+            // and each step moves the curves by the same distance.
             let cfg = (theme::generation(), CFG_GEN.with(Cell::get));
             let moved = (u0 - self.last_u0.get()).abs();
-            let since_render = frame_us - self.last_render.get();
+            let n = (frame_us + refresh / 2).div_euclid(refresh);
+            let last_n = self.last_render_n.get();
+            let k = frames_per_redraw(refresh as f64 / dt, opts.step_px as f64, k_cap);
+            let due = |k: i64| n.div_euclid(k) != last_n.div_euclid(k);
             let need = structural
-                || easing
+                || reappeared
                 || cfg != self.rendered_cfg.get()
-                || moved >= 0.25
-                || (updated && (moved >= 0.05 || since_render >= 250_000));
+                || (easing && due(k_cap))
+                || (due(k) && (moved >= 0.2 || updated));
             if need {
                 if let Some(a) = self.area.borrow().as_ref() {
                     a.queue_render();
                 }
-                self.last_render.set(frame_us);
+                self.last_render_n.set(n);
             }
         }
 
@@ -735,7 +831,7 @@ mod imp {
             let Some(g) = gl::api() else { return };
             let t0 = glib::monotonic_time();
             let res = self.res.borrow();
-            let Some(prog) = res.prog else { return };
+            let Some(progs) = res.prog else { return };
             let (mut fw, mut fh) = self.fbo.get();
             if fw <= 0 || fh <= 0 {
                 let mut vp = [0i32; 4];
@@ -845,12 +941,7 @@ mod imp {
             let u0 = self.u0.get();
             let scale = self.dev_scale.get().max(1.0) as f32;
             let res = self.res.borrow();
-            unsafe {
-                (g.disable())(gl::BLEND);
-                (g.disable())(gl::DEPTH_TEST);
-                (g.disable())(gl::SCISSOR_TEST);
-                (g.use_program())(prog.id);
-                let l = prog.loc;
+            let curve_uniforms = |l: &gl::Locs| unsafe {
                 (g.uniform1i())(l.data, 0);
                 (g.uniform1i())(l.texw, texw as i32);
                 (g.uniform1f())(l.u0, u0.rem_euclid(texw as f64) as f32);
@@ -861,16 +952,48 @@ mod imp {
                 (g.uniform4fv())(l.fill, 2, fill.as_ptr());
                 (g.uniform4fv())(l.line, 2, line.as_ptr());
                 (g.uniform1f())(l.hw, LINE_PX.with(Cell::get) * 0.5);
+            };
+            let grid_uniforms = |l: &gl::Locs| unsafe {
+                (g.uniform2f())(l.size, fw as f32, fh as f32);
                 (g.uniform4fv())(l.grid, 1, grid.as_ptr());
                 (g.uniform1fv())(l.vgrid, 8, vgrid.as_ptr());
                 (g.uniform1i())(l.nv, nv as i32);
+            };
+            unsafe {
+                (g.disable())(gl::DEPTH_TEST);
+                (g.disable())(gl::SCISSOR_TEST);
                 (g.bind_vertex_array())(res.vao);
-                (g.draw_arrays())(gl::TRIANGLES, 0, 3);
+                if OPTS.with(Cell::get).strip {
+                    // Clear (nearly free), grid lines as thin quads, then the
+                    // curve shader on the strip under the curves, blended over
+                    // the grid (premultiplied "over", as in the full shader).
+                    (g.clear_color())(0.0, 0.0, 0.0, 0.0);
+                    (g.clear())(gl::COLOR_BUFFER_BIT);
+                    (g.enable())(gl::BLEND);
+                    (g.blend_func())(gl::ONE, gl::ONE_MINUS_SRC_ALPHA);
+                    if grid[3] > 0.0 {
+                        (g.use_program())(progs.grid.id);
+                        grid_uniforms(&progs.grid.loc);
+                        (g.draw_arrays())(gl::TRIANGLES, 0, 6 * (3 + nv as i32));
+                    }
+                    (g.use_program())(progs.strip.id);
+                    curve_uniforms(&progs.strip.loc);
+                    let blocks = (fw + gl::STRIP_BLOCK - 1) / gl::STRIP_BLOCK;
+                    (g.draw_arrays())(gl::TRIANGLE_STRIP, 0, 2 * (blocks + 1));
+                    (g.disable())(gl::BLEND);
+                } else {
+                    (g.disable())(gl::BLEND);
+                    (g.use_program())(progs.full.id);
+                    curve_uniforms(&progs.full.loc);
+                    grid_uniforms(&progs.full.loc);
+                    (g.draw_arrays())(gl::TRIANGLES, 0, 3);
+                }
                 (g.bind_vertex_array())(0);
                 (g.use_program())(0);
             }
             self.last_u0.set(u0);
             self.rendered_cfg.set((theme::generation(), CFG_GEN.with(Cell::get)));
+            DRAWS.with(|d| d.set(d.get() + 1));
             prof_add(|pr| {
                 pr.draws += 1;
                 pr.draw_us += glib::monotonic_time() - t0;
@@ -1120,6 +1243,24 @@ mod tests {
         assert_eq!(super::grid_step_us(60_000_000), 10_000_000);
         assert_eq!(super::grid_step_us(3600_000_000), 600_000_000);
         assert_eq!(super::scale_label(900), "15 min");
+    }
+
+    #[test]
+    fn redraw_pacing() {
+        use super::{frames_per_redraw as k, pow2_at_least};
+        // 1 px steps: 0.5 px/frame → every 2nd frame; 0.33 → 2 (0.67 px); 0.1 → 8 (0.8 px).
+        assert_eq!(k(0.5, 1.0, 1), 2);
+        assert_eq!(k(0.33, 1.0, 1), 2);
+        assert_eq!(k(0.1, 1.0, 1), 8);
+        assert_eq!(k(1.0, 1.0, 1), 1);
+        assert_eq!(k(3.0, 1.0, 1), 1, "fast graphs still redraw every frame");
+        assert_eq!(k(0.0001, 1.0, 1), 64, "at most every 64 frames");
+        assert_eq!(k(0.5, 0.25, 1), 1, "Smoothest");
+        assert_eq!(k(0.5, 1.0, 4), 4, "frame-rate cap wins");
+        // Caps round up to powers of two so all graphs share one frame grid.
+        assert_eq!(pow2_at_least(0), 1);
+        assert_eq!(pow2_at_least(2), 2);
+        assert_eq!(pow2_at_least(3), 4);
     }
 
     #[test]

@@ -1,5 +1,24 @@
 # Changelog
 
+## 0.2.2 — 2026-11-08
+
+### Floating readouts
+- The CPU readout can show every logical CPU: right-click it and choose **Logical CPUs**. Enlarge the readout to give them room. The separate CPU Cores readout is still there.
+
+### Lighter on the GPU
+- **Paced redraws.** A scrolling graph now redraws once it has moved about one pixel, rather than every quarter pixel. All graphs in a window share one frame grid, so the window and the compositor redraw less often too. Every step covers the same distance, so motion stays even. At the default 1-minute scale on a 4K screen, the Overview's graphs redraw about 30 times a second instead of 60; narrower graphs and longer time scales redraw far less. Preferences → Performance → **Graph motion** chooses Smoothest (the previous behaviour), Balanced (the default) or Battery saver.
+- **Shading only under the curves.** The graph shader no longer runs on every pixel. The framebuffer is cleared, grid lines are drawn as thin quads, and the curve shader runs only on a strip that covers the area under the curves, in 8-pixel blocks. Output matches the previous renderer: grid-line pixels differ by at most 2/255.
+- **Graphs scrolled out of view do no work** until they're scrolled back.
+- In a software-rendered test (Mesa llvmpipe, 1× scale, Overview), Plume's CPU use fell from 79 % to 23 % of a core.
+
+### Measuring on your own machine
+- `plume --bench` runs the Overview through each renderer variant, from 0.2.1 to the current defaults. For each it prints the GPU time of Plume and of the compositor (from the kernel's per-client GPU accounting, as `intel_gpu_top` uses), the window's redraw rate, graph draws per second and Plume's CPU use. Quit Plume first.
+- `PLUME_PROFILE=1 plume` also prints Plume's and gnome-shell's GPU busy time every 5 s.
+- About → Troubleshooting shows which renderer GTK uses (Vulkan or OpenGL) alongside the graph renderer.
+
+### Fixed
+- If the display time stood still while samples kept arriving, a graph's incremental update could request an invalid texture upload. Empty update ranges are now ignored.
+
 ## 0.2.1 — 2026-11-04
 
 ### Floating readouts

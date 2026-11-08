@@ -29,6 +29,15 @@ const GRIP_PX: i32 = 16;
 thread_local! {
     static OPEN: RefCell<BTreeMap<String, gtk::Window>> = RefCell::new(BTreeMap::new());
     static GRAPHS: RefCell<BTreeMap<String, Vec<Graph>>> = RefCell::new(BTreeMap::new());
+    /// The CPU readout's view switch (total / logical CPUs), while it is open.
+    static CPU_VIEW: RefCell<glib::WeakRef<gtk::Stack>> = RefCell::new(glib::WeakRef::new());
+}
+
+/// Switches the CPU readout between the total and every logical CPU.
+pub fn set_cpu_logical(on: bool) {
+    if let Some(st) = CPU_VIEW.with(|v| v.borrow().upgrade()) {
+        st.set_visible_child_name(if on { "logical" } else { "total" });
+    }
 }
 
 /// Gives float `id` its own time scale and remembers it.
@@ -125,24 +134,9 @@ pub fn open(id: &str) {
     let mut graphs: Vec<Graph> = Vec::new();
     let default_size: (i32, i32);
     let body: gtk::Widget = if id == "cores" {
-        let grid = gtk::Grid::new();
-        grid.set_row_spacing(3);
-        grid.set_column_spacing(3);
-        grid.set_row_homogeneous(true);
-        grid.set_column_homogeneous(true);
-        grid.set_margin_top(2);
-        grid.set_margin_start(6);
-        grid.set_margin_end(6);
-        grid.set_margin_bottom(6);
-        let cols = if n_cores > 8 { 4 } else { n_cores.clamp(1, 4) };
-        for i in 0..n_cores {
-            let g = Graph::new(&[Line { key: Key::Core(i), color: Color::Core(i), fill: true }], Scale::Unit);
-            g.set_grid(false);
-            g.set_size_request(24, 16);
-            grid.attach(&g, (i % cols) as i32, (i / cols) as i32, 1, 1);
-            graphs.push(g);
-        }
-        default_size = (300, 36 + 34 * n_cores.div_ceil(cols) as i32 + 10);
+        let (grid, cores, height) = cores_grid(n_cores);
+        graphs.extend(cores);
+        default_size = (300, height);
         grid.upcast()
     } else {
         let (lines, scale) = lines_for(id, gpu_idx);
@@ -153,7 +147,23 @@ pub fn open(id: &str) {
         g.set_margin_bottom(6);
         default_size = (260, 124);
         graphs.push(g.clone());
-        g.upcast()
+        if id == "cpu" {
+            // The CPU readout can also show every logical CPU (right-click menu).
+            // The hidden page's graphs aren't mapped, so they cost nothing.
+            let (grid, cores, _) = cores_grid(n_cores);
+            graphs.extend(cores);
+            let stack = gtk::Stack::new();
+            stack.set_hhomogeneous(false);
+            stack.set_vhomogeneous(false);
+            stack.add_named(&g, Some("total"));
+            stack.add_named(&grid, Some("logical"));
+            let logical = settings::with(|s| s.float_cpu_logical);
+            stack.set_visible_child_name(if logical { "logical" } else { "total" });
+            CPU_VIEW.with(|v| v.borrow().set(Some(&stack)));
+            stack.upcast()
+        } else {
+            g.upcast()
+        }
     };
 
     // Each float has its own time scale; scrolling over it changes it.
@@ -214,6 +224,9 @@ pub fn open(id: &str) {
         ts.append_item(&it);
     }
     menu.append_submenu(Some("Time Scale"), &ts);
+    if id == "cpu" {
+        menu.append(Some("Logical CPUs"), Some("app.float-cpu-logical"));
+    }
     let close_item = gio::MenuItem::new(Some("Close"), None);
     close_item.set_action_and_target_value(Some("app.float"), Some(&id.to_variant()));
     menu.append_item(&close_item);
@@ -375,6 +388,30 @@ pub fn open(id: &str) {
     win.present();
     app::update_demand();
     app::maybe_hint_extension();
+}
+
+/// A grid with one graph per logical CPU; returns it, its graphs and a
+/// default window height that fits it.
+fn cores_grid(n_cores: usize) -> (gtk::Grid, Vec<Graph>, i32) {
+    let grid = gtk::Grid::new();
+    grid.set_row_spacing(3);
+    grid.set_column_spacing(3);
+    grid.set_row_homogeneous(true);
+    grid.set_column_homogeneous(true);
+    grid.set_margin_top(2);
+    grid.set_margin_start(6);
+    grid.set_margin_end(6);
+    grid.set_margin_bottom(6);
+    let cols = if n_cores > 8 { 4 } else { n_cores.clamp(1, 4) };
+    let mut graphs = Vec::with_capacity(n_cores);
+    for i in 0..n_cores {
+        let g = Graph::new(&[Line { key: Key::Core(i), color: Color::Core(i), fill: true }], Scale::Unit);
+        g.set_grid(false);
+        g.set_size_request(24, 16);
+        grid.attach(&g, (i % cols) as i32, (i / cols) as i32, 1, 1);
+        graphs.push(g);
+    }
+    (grid, graphs, 36 + 34 * n_cores.div_ceil(cols) as i32 + 10)
 }
 
 /// Header value width in characters: room for the longest value, so the text

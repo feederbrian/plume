@@ -18,6 +18,8 @@ pub struct Settings {
     pub fps_cap_bg: u32,
     /// Graph line width in device pixels.
     pub line_px: f64,
+    /// Scrolling graphs redraw once they have moved this many device pixels.
+    pub motion_step: f64,
     /// True-black backgrounds for dark themes (OLED panels).
     pub oled: bool,
     pub smooth: bool,
@@ -39,6 +41,8 @@ pub struct Settings {
     pub float_sizes: BTreeMap<String, (i32, i32)>,
     /// Overview card order (card ids); cards not listed keep their default place.
     pub card_order: Vec<String>,
+    /// The CPU floating readout shows every logical CPU instead of the total.
+    pub float_cpu_logical: bool,
 }
 
 impl Default for Settings {
@@ -51,6 +55,7 @@ impl Default for Settings {
             fps_cap: 60,
             fps_cap_bg: 30,
             line_px: 1.5,
+            motion_step: 1.0,
             oled: false,
             smooth: false,
             cpu_per_core: false,
@@ -67,6 +72,7 @@ impl Default for Settings {
             float_scales: BTreeMap::new(),
             float_sizes: BTreeMap::new(),
             card_order: Vec::new(),
+            float_cpu_logical: false,
         }
     }
 }
@@ -98,6 +104,7 @@ fn load() -> Settings {
     if let Some(v) = int("fps_cap") { s.fps_cap = v.clamp(0, 240) as u32; }
     if let Some(v) = int("fps_cap_bg") { s.fps_cap_bg = v.clamp(0, 240) as u32; }
     if let Some(v) = dbl("line_px") { s.line_px = v.clamp(0.5, 6.0); }
+    if let Some(v) = dbl("motion_step") { s.motion_step = v.clamp(0.1, 8.0); }
     if let Some(v) = boo("oled") { s.oled = v; }
     if let Some(v) = boo("smooth") { s.smooth = v; }
     if let Some(v) = boo("cpu_per_core") { s.cpu_per_core = v; }
@@ -105,6 +112,7 @@ fn load() -> Settings {
     if let Some(v) = boo("show_kernel_threads") { s.show_kernel_threads = v; }
     if let Some(v) = str_("proc_filter") { s.proc_filter = v; }
     if let Some(v) = boo("confirm_kill") { s.confirm_kill = v; }
+    if let Some(v) = boo("float_cpu_logical") { s.float_cpu_logical = v; }
     if let Some(v) = dbl("float_opacity") { s.float_opacity = v.clamp(0.3, 1.0); }
     if let Some(v) = str_("floats") {
         s.floats = v.split(',').filter(|x| !x.is_empty()).map(str::to_string).collect();
@@ -157,6 +165,7 @@ fn save(s: &Settings) {
     kf.set_integer(G, "fps_cap", s.fps_cap as i32);
     kf.set_integer(G, "fps_cap_bg", s.fps_cap_bg as i32);
     kf.set_double(G, "line_px", s.line_px);
+    kf.set_double(G, "motion_step", s.motion_step);
     kf.set_boolean(G, "oled", s.oled);
     kf.set_boolean(G, "smooth", s.smooth);
     kf.set_boolean(G, "cpu_per_core", s.cpu_per_core);
@@ -164,6 +173,7 @@ fn save(s: &Settings) {
     kf.set_boolean(G, "show_kernel_threads", s.show_kernel_threads);
     kf.set_string(G, "proc_filter", &s.proc_filter);
     kf.set_boolean(G, "confirm_kill", s.confirm_kill);
+    kf.set_boolean(G, "float_cpu_logical", s.float_cpu_logical);
     kf.set_double(G, "float_opacity", s.float_opacity);
     kf.set_string(G, "floats", &s.floats.join(","));
     kf.set_string(G, "card_order", &s.card_order.join(","));

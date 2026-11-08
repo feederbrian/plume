@@ -212,6 +212,50 @@ impl DrmScanner {
     }
 }
 
+/// Cumulative GPU engine counters of one process: (device, engine) → (busy,
+/// total). For time-based drivers (i915, amdgpu) busy is in ns and total is 0;
+/// for cycle-based ones (xe) busy is in cycles and total is the GPU's cycle
+/// counter. Summed over the process's DRM clients (each counted once).
+pub type EngineCounters = HashMap<(String, String), (u64, u64)>;
+
+/// Reads `EngineCounters` for `pid` (own processes, or any as root).
+pub fn process_counters(pid: i32) -> EngineCounters {
+    let mut out: EngineCounters = HashMap::new();
+    let mut seen = std::collections::HashSet::new();
+    let Ok(rd) = std::fs::read_dir(format!("/proc/{pid}/fd")) else { return out };
+    for e in rd.flatten() {
+        let Ok(target) = std::fs::read_link(e.path()) else { continue };
+        if !target.as_os_str().as_encoded_bytes().starts_with(b"/dev/dri/") {
+            continue;
+        }
+        let Ok(b) = std::fs::read(format!("/proc/{pid}/fdinfo/{}", e.file_name().to_string_lossy())) else { continue };
+        let Some((pdev, id, engines, _)) = parse_fdinfo(&b) else { continue };
+        if !seen.insert((pdev.clone(), id)) {
+            continue;
+        }
+        for (eng, (busy, total)) in engines {
+            let c = out.entry((pdev.clone(), eng)).or_default();
+            c.0 += busy;
+            c.1 = c.1.max(total); // the cycle counter is the GPU's, not per client
+        }
+    }
+    out
+}
+
+/// Busiest "main" engine (render / rcs / gfx; else any) between two snapshots
+/// taken `dt_ns` apart: (engine, busy fraction), or None without GPU clients.
+pub fn main_engine_busy(a: &EngineCounters, b: &EngineCounters, dt_ns: u64) -> Option<(String, f32)> {
+    let busy = |(k, &(v1, t1)): (&(String, String), &(u64, u64))| {
+        let (v0, t0) = a.get(k).copied().unwrap_or((v1, t1));
+        let f = if t1 > t0 { v1.saturating_sub(v0) as f64 / (t1 - t0) as f64 } else { v1.saturating_sub(v0) as f64 / dt_ns.max(1) as f64 };
+        (k.1.clone(), f.clamp(0.0, 1.0) as f32)
+    };
+    let main = |e: &str| matches!(e, "render" | "rcs" | "gfx");
+    let all: Vec<(String, f32)> = b.iter().map(busy).collect();
+    let pick = |v: Vec<&(String, f32)>| v.into_iter().max_by(|x, y| x.1.total_cmp(&y.1)).cloned();
+    pick(all.iter().filter(|(e, _)| main(e)).collect()).or_else(|| pick(all.iter().collect()))
+}
+
 type Parsed = (String, u64, HashMap<String, (u64, u64)>, Vec<(String, u64)>);
 
 /// Parses one fdinfo file: (pdev, client id, engine → (value, total cycles), capacities).
@@ -261,6 +305,27 @@ drm-engine-render:\t11380263218 ns\ndrm-engine-copy:\t0 ns\ndrm-engine-video:\t4
         let (_, _, eng, _) = parse_fdinfo(xe).unwrap();
         assert_eq!(eng["rcs"], (28257900, 7655183225));
         assert!(parse_fdinfo(b"pos: 0\nflags: 0\n").is_none(), "not a DRM fd");
+    }
+
+    #[test]
+    fn engine_busy_between_snapshots() {
+        let dev = "0000:00:02.0".to_string();
+        let snap = |v: &[(&str, u64, u64)]| -> EngineCounters {
+            v.iter().map(|&(e, busy, total)| ((dev.clone(), e.to_string()), (busy, total))).collect()
+        };
+        // i915: ns of engine time over 1 s of wall time; render beats a busier copy engine.
+        let a = snap(&[("render", 1_000_000_000, 0), ("copy", 0, 0)]);
+        let b = snap(&[("render", 1_500_000_000, 0), ("copy", 900_000_000, 0)]);
+        let (e, f) = main_engine_busy(&a, &b, 1_000_000_000).unwrap();
+        assert_eq!(e, "render");
+        assert!((f - 0.5).abs() < 1e-6);
+        // xe: busy cycles over the GPU's cycle counter.
+        let a = snap(&[("rcs", 100, 1_000)]);
+        let b = snap(&[("rcs", 600, 2_000)]);
+        assert!((main_engine_busy(&a, &b, 1).unwrap().1 - 0.5).abs() < 1e-6);
+        assert!(main_engine_busy(&a, &EngineCounters::new(), 1).is_none());
+        // Our own process: no panic, whatever the machine has.
+        let _ = process_counters(std::process::id() as i32);
     }
 
     #[test]

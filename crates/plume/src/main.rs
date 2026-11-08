@@ -1,6 +1,7 @@
 //! Plume — a featherweight GNOME system monitor.
 
 mod app;
+mod bench;
 mod floats;
 mod format;
 mod inspector;

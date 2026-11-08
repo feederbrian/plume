@@ -48,6 +48,9 @@ impl Columns {
     }
 
     fn mark(&mut self, lo: i64, hi: i64) {
+        if hi < lo {
+            return;
+        }
         self.dirty = Some(match self.dirty {
             Some((a, b)) => (a.min(lo), b.max(hi)),
             None => (lo, hi),
@@ -112,6 +115,10 @@ impl Columns {
     /// Recomputes the envelope for every column whose 6-vertex window
     /// overlaps `lo..=hi` (call after updating series data).
     pub fn update_env(&mut self, lo: i64, hi: i64) {
+        // Empty when the display time stands still while data keeps coming.
+        if hi < lo {
+            return;
+        }
         let (lo, hi) = (lo - 3, hi + 2);
         let lo = lo.max(hi - self.texw as i64 + 1);
         for c in lo..=hi {
@@ -153,6 +160,9 @@ impl Columns {
     /// Upload `data[slot..slot+len]` to row 0 and `env[..]` to row 1.
     pub fn take_dirty(&mut self) -> Vec<(usize, usize)> {
         let Some((lo, hi)) = self.dirty.take() else { return Vec::new() };
+        if hi < lo {
+            return Vec::new();
+        }
         let lo = lo.max(hi - self.texw as i64 + 1);
         let len = (hi - lo + 1) as usize;
         let s0 = self.slot(lo);
@@ -238,4 +248,15 @@ mod tests {
             assert!((0.0..=1.0).contains(&v));
         }
     }
+    #[test]
+    fn empty_ranges_mark_nothing() {
+        // Display time frozen, data still arriving: the update range is empty.
+        let mut c = Columns::default();
+        c.reset(64, 1.0, 1);
+        c.take_dirty();
+        c.update_series(0, &[(0, 0.5), (100, 0.5)], 50, 40, false);
+        c.update_env(50, 40);
+        assert!(c.take_dirty().is_empty());
+    }
+
 }

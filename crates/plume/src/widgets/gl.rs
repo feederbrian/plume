@@ -26,6 +26,10 @@ pub const FRAGMENT_SHADER: u32 = 0x8B30;
 pub const COMPILE_STATUS: u32 = 0x8B81;
 pub const LINK_STATUS: u32 = 0x8B82;
 pub const TRIANGLES: u32 = 0x0004;
+pub const TRIANGLE_STRIP: u32 = 0x0005;
+pub const COLOR_BUFFER_BIT: u32 = 0x0000_4000;
+pub const ONE: u32 = 1;
+pub const ONE_MINUS_SRC_ALPHA: u32 = 0x0303;
 pub const BLEND: u32 = 0x0BE2;
 pub const DEPTH_TEST: u32 = 0x0B71;
 pub const SCISSOR_TEST: u32 = 0x0C11;
@@ -92,6 +96,10 @@ gl_api! {
     pixel_storei = "epoxy_glPixelStorei": unsafe extern "C" fn(u32, i32);
     draw_arrays = "epoxy_glDrawArrays": unsafe extern "C" fn(u32, i32, i32);
     disable = "epoxy_glDisable": unsafe extern "C" fn(u32);
+    enable = "epoxy_glEnable": unsafe extern "C" fn(u32);
+    blend_func = "epoxy_glBlendFunc": unsafe extern "C" fn(u32, u32);
+    clear_color = "epoxy_glClearColor": unsafe extern "C" fn(f32, f32, f32, f32);
+    clear = "epoxy_glClear": unsafe extern "C" fn(u32);
     get_integerv = "epoxy_glGetIntegerv": unsafe extern "C" fn(u32, *mut i32);
     viewport = "epoxy_glViewport": unsafe extern "C" fn(i32, i32, i32, i32);
 }
@@ -138,12 +146,102 @@ pub struct Program {
     pub loc: Locs,
 }
 
-const VERTEX: &str = r#"
+/// The graph programs. `strip` + `grid` is the normal path: the framebuffer is
+/// cleared, grid lines are drawn as 1 px quads, and the curve shader runs only
+/// on a strip that covers the area under the curves. `full` runs the curve and
+/// grid shader on every pixel (the 0.2.0–0.2.1 renderer), for comparison.
+#[derive(Clone, Copy, Debug)]
+pub struct Programs {
+    pub full: Program,
+    pub strip: Program,
+    pub grid: Program,
+}
+
+const VERTEX_FULL: &str = r#"
 void main() {
     // One triangle that covers the viewport.
     vec2 p = vec2(float((gl_VertexID << 1) & 2), float(gl_VertexID & 2));
     gl_Position = vec4(p * 2.0 - 1.0, 0.0, 1.0);
 }
+"#;
+
+/// Pixel columns per strip block. Blocks this wide keep the strip's triangles
+/// cheap to set up and efficient to shade (GPUs shade 2×2 pixel quads, so
+/// 1 px wide triangles would waste half of every quad).
+pub const STRIP_BLOCK: i32 = 8;
+
+/// A triangle strip with a vertex pair at every block boundary: one on the
+/// bottom edge, one just above the curves' envelope over the two blocks that
+/// meet there. Each pixel column's data column comes from the same formula as
+/// in the fragment shader, and the envelope covers that shader's whole
+/// 6-column window, so the strip contains every pixel the curve shader can
+/// touch (with a pixel to spare), and nothing above it is ever shaded.
+const VERTEX_STRIP: &str = r#"
+uniform sampler2D u_data;
+uniform int u_texw;
+uniform float u_u0;
+uniform vec2 u_size;
+uniform float u_ymax;
+uniform float u_pad;
+uniform int u_n;
+uniform float u_hw;
+const int BLOCK = 8;
+
+float top_at(int i) {
+    vec4 e = texelFetch(u_data, ivec2(i % u_texw, 1), 0);
+    float t = -1.0;
+    if (e.y >= 0.0) t = e.y;
+    if (u_n > 1 && e.w >= 0.0) t = max(t, e.w);
+    return t;
+}
+
+void main() {
+    float x = min(float((gl_VertexID >> 1) * BLOCK), u_size.x);
+    float y = 0.0;
+    if ((gl_VertexID & 1) == 1) {
+        // Data column of the first pixel column of the block to the left
+        // (kept non-negative, see the fragment shader); consecutive pixel
+        // columns use consecutive data columns.
+        int i = int(floor(u_u0 - u_size.x + x - float(BLOCK) + 0.5 + float(u_texw)));
+        float t = -1.0;
+        for (int k = 0; k < 2 * BLOCK; k++) t = max(t, top_at(i + k));
+        if (t >= 0.0) {
+            float h = clamp(t / u_ymax, 0.0, 1.0) * (u_size.y - u_pad);
+            y = clamp(h + u_hw + 2.5, 0.0, u_size.y);
+        }
+    }
+    gl_Position = vec4(x / u_size.x * 2.0 - 1.0, y / u_size.y * 2.0 - 1.0, 0.0, 1.0);
+}
+"#;
+
+/// Grid lines as quads, 6 vertices each: three horizontal lines at the
+/// quarters, then `u_nv` vertical time lines. Same pixels as the full shader.
+const VERTEX_GRID: &str = r#"
+uniform vec2 u_size;
+uniform float u_vgrid[8];
+uniform int u_nv;
+void main() {
+    int q = gl_VertexID / 6;
+    int v = gl_VertexID - q * 6;
+    vec2 c = vec2((v == 1 || v == 4 || v == 5) ? 1.0 : 0.0, (v == 2 || v == 3 || v == 5) ? 1.0 : 0.0);
+    vec2 lo, hi;
+    if (q < 3) {
+        float y = floor(u_size.y * 0.25 * float(q + 1));
+        lo = vec2(0.0, y);
+        hi = vec2(u_size.x, y + 1.0);
+    } else {
+        float x = floor(u_vgrid[q - 3]);
+        lo = vec2(x, 0.0);
+        hi = vec2(x + 1.0, u_size.y);
+    }
+    gl_Position = vec4(mix(lo, hi, c) / u_size * 2.0 - 1.0, 0.0, 1.0);
+}
+"#;
+
+const FRAGMENT_GRID: &str = r#"
+uniform vec4 u_grid;
+layout(location = 0) out vec4 frag;
+void main() { frag = u_grid; }
 "#;
 
 /// The whole graph is one fragment shader, specialised for up to two series.
@@ -186,19 +284,8 @@ vec2 segdist2(vec2 p, float xa, vec2 ya, float xb, vec2 yb) {
     return sqrt(dx * dx + dy * dy);
 }
 
-void main() {
-    vec2 p = gl_FragCoord.xy;
-    vec4 col = vec4(0.0);
-    if (u_grid.a > 0.0) {
-        float hy = u_size.y * 0.25;
-        for (int k = 1; k < 4; k++) {
-            if (abs(p.y - (floor(hy * float(k)) + 0.5)) < 0.5) col = over(col, u_grid);
-        }
-        for (int k = 0; k < 8; k++) {
-            if (k >= u_nv) break;
-            if (abs(p.x - (floor(u_vgrid[k]) + 0.5)) < 0.5) col = over(col, u_grid);
-        }
-    }
+// Fills and lines over `col` at pixel p.
+vec4 curve(vec2 p, vec4 col) {
     // u_u0 is in [0, texw) and texw > width + 8, so adding texw keeps every
     // index we touch (i0 - 2 .. i0 + 3) non-negative.
     float u = u_u0 - u_size.x + p.x + float(u_texw);
@@ -214,7 +301,7 @@ void main() {
     vec2 ybot = ypix(vec2(env.x, env.z));
     float slack = u_hw + 1.5;
     float top = max(has.x ? ytop.x : -1e9, has.y ? ytop.y : -1e9);
-    if (p.y > top + slack) { frag = col; return; }   // empty space above the curves
+    if (p.y > top + slack) return col;   // empty space above the curves
 
     // Fills: flat inside, exact coverage only along the boundary.
     vec4 c2 = col_at(i0), c3 = col_at(i0 + 1);
@@ -243,8 +330,32 @@ void main() {
         if (near.x) col = over(col, u_line[0] * lcov.x);
         if (near.y) col = over(col, u_line[1] * lcov.y);
     }
-    frag = col;
+    return col;
 }
+"#;
+
+/// Every pixel: grid lines, then the curves.
+const MAIN_FULL: &str = r#"
+void main() {
+    vec2 p = gl_FragCoord.xy;
+    vec4 col = vec4(0.0);
+    if (u_grid.a > 0.0) {
+        float hy = u_size.y * 0.25;
+        for (int k = 1; k < 4; k++) {
+            if (abs(p.y - (floor(hy * float(k)) + 0.5)) < 0.5) col = over(col, u_grid);
+        }
+        for (int k = 0; k < 8; k++) {
+            if (k >= u_nv) break;
+            if (abs(p.x - (floor(u_vgrid[k]) + 0.5)) < 0.5) col = over(col, u_grid);
+        }
+    }
+    frag = curve(p, col);
+}
+"#;
+
+/// Strip pixels only: the curves, blended over the grid already drawn.
+const MAIN_STRIP: &str = r#"
+void main() { frag = curve(gl_FragCoord.xy, vec4(0.0)); }
 "#;
 
 fn compile(gl: &Gl, kind: u32, header: &str, body: &str) -> Result<u32, String> {
@@ -267,15 +378,29 @@ fn compile(gl: &Gl, kind: u32, header: &str, body: &str) -> Result<u32, String> 
     }
 }
 
-/// Compiles and links the graph program for the current context.
-pub fn build_program(gl: &Gl, gles: bool) -> Result<Program, String> {
+/// Compiles and links the graph programs for the current context.
+pub fn build_programs(gl: &Gl, gles: bool) -> Result<Programs, String> {
     let header = if gles {
         "#version 300 es\nprecision highp float;\nprecision highp int;\nprecision highp sampler2D;\n"
     } else {
         "#version 330 core\n"
     };
-    let vs = compile(gl, VERTEX_SHADER, header, VERTEX)?;
-    let fs = compile(gl, FRAGMENT_SHADER, header, FRAGMENT)?;
+    Ok(Programs {
+        full: link(gl, header, VERTEX_FULL, &format!("{FRAGMENT}{MAIN_FULL}"))?,
+        strip: link(gl, header, VERTEX_STRIP, &format!("{FRAGMENT}{MAIN_STRIP}"))?,
+        grid: link(gl, header, VERTEX_GRID, FRAGMENT_GRID)?,
+    })
+}
+
+fn link(gl: &Gl, header: &str, vertex: &str, fragment: &str) -> Result<Program, String> {
+    let vs = compile(gl, VERTEX_SHADER, header, vertex)?;
+    let fs = match compile(gl, FRAGMENT_SHADER, header, fragment) {
+        Ok(fs) => fs,
+        Err(e) => {
+            unsafe { (gl.delete_shader())(vs) };
+            return Err(e);
+        }
+    };
     unsafe {
         let p = (gl.create_program())();
         (gl.attach_shader())(p, vs);

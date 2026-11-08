@@ -98,6 +98,36 @@ pub fn is_quitting() -> bool {
     QUITTING.with(Cell::get)
 }
 
+pub fn main_window() -> Option<adw::ApplicationWindow> {
+    MAIN.with(|m| m.borrow().as_ref().map(|m| m.win.clone()))
+}
+
+pub fn show_tab(name: &str) {
+    MAIN.with(|m| {
+        if let Some(m) = m.borrow().as_ref() {
+            m.stack.set_visible_child_name(name);
+        }
+    });
+}
+
+/// GTK's renderer for our windows, e.g. "Vulkan (GskVulkanRenderer)".
+pub fn gsk_renderer_name() -> String {
+    let w: Option<gtk::Window> = main_window().map(|w| w.upcast()).or_else(active_window);
+    match w.and_then(|w| w.renderer()) {
+        Some(r) => {
+            let t = r.type_().name().to_string();
+            let kind = match t.as_str() {
+                "GskVulkanRenderer" => "Vulkan",
+                "GskGLRenderer" | "GskNglRenderer" => "OpenGL",
+                "GskCairoRenderer" => "Cairo (software)",
+                _ => "other",
+            };
+            format!("{kind} ({t})")
+        }
+        None => "not started".into(),
+    }
+}
+
 pub fn active_window() -> Option<gtk::Window> {
     application().and_then(|a| a.active_window())
 }
@@ -334,6 +364,16 @@ fn setup_actions(app: &adw::Application) {
     });
     app.add_action(&fs);
 
+    let logical = settings::with(|s| s.float_cpu_logical);
+    let lg = gio::SimpleAction::new_stateful("float-cpu-logical", None, &logical.to_variant());
+    lg.connect_activate(|a, _| {
+        let on = !a.state().and_then(|v| v.get::<bool>()).unwrap_or(false);
+        a.set_state(&on.to_variant());
+        settings::update(|s| s.float_cpu_logical = on);
+        floats::set_cpu_logical(on);
+    });
+    app.add_action(&lg);
+
     let op = gio::SimpleAction::new("float-opacity", Some(glib::VariantTy::DOUBLE));
     op.connect_activate(|_, p| {
         if let Some(v) = p.and_then(|v| v.get::<f64>()) {
@@ -366,8 +406,9 @@ fn setup_actions(app: &adw::Application) {
             .build();
         let cost = with_shared(|s| (s.fast_cost_us, s.proc_stats.elapsed_us, s.proc_stats.processes));
         d.set_debug_info(&format!(
-            "Graph renderer: {}\nFast sample: {} µs\nProcess scan: {} µs for {} processes\nGTK {}.{}.{}\nlibadwaita {}.{}.{}\n",
+            "Graph renderer: {}\nGTK renderer: {}\nFast sample: {} µs\nProcess scan: {} µs for {} processes\nGTK {}.{}.{}\nlibadwaita {}.{}.{}\n",
             graph::renderer_name(),
+            gsk_renderer_name(),
             cost.0,
             cost.1,
             cost.2,
@@ -464,6 +505,8 @@ pub const HELP: &str = "Usage: plume [--float ID]... [--background]
   --float ID     open a floating readout (repeatable)
                  IDs: cpu, cores, mem, gpu0, gpu1, net, disk
   --background   don't open the main window (floats only)
+  --bench[=SECS] measure the graph renderer's GPU and CPU cost on this
+                 machine (Overview, SECS per variant, default 15), then quit
   --version      print version
 ";
 
@@ -471,6 +514,7 @@ fn handle_command_line(app: &adw::Application, cmd: &gio::ApplicationCommandLine
     let args: Vec<String> = cmd.arguments().iter().skip(1).map(|a| a.to_string_lossy().into_owned()).collect();
     let mut floats_req = Vec::new();
     let mut background = false;
+    let mut bench = None;
     let mut it = args.iter();
     while let Some(a) = it.next() {
         match a.as_str() {
@@ -481,11 +525,30 @@ fn handle_command_line(app: &adw::Application, cmd: &gio::ApplicationCommandLine
             }
             s if s.starts_with("--float=") => floats_req.push(s["--float=".len()..].to_string()),
             "--background" | "-b" => background = true,
+            "--bench" => bench = Some(15),
+            s if s.starts_with("--bench=") => bench = s["--bench=".len()..].parse().ok().or(Some(15)),
             other => {
                 eprintln!("plume: unknown option {other} (see plume --help)");
                 return glib::ExitCode::FAILURE;
             }
         }
+    }
+    if let Some(secs) = bench {
+        // The table prints in the process that runs the bench, which then quits.
+        if cmd.is_remote() {
+            let msg = c"plume: Plume is already running; quit it first, then run plume --bench\n";
+            // printerr_literal needs GLib 2.80; the printf-style call works everywhere.
+            unsafe {
+                gio::ffi::g_application_command_line_printerr(
+                    glib::translate::ToGlibPtr::to_glib_none(cmd).0,
+                    c"%s".as_ptr(),
+                    msg.as_ptr(),
+                )
+            };
+            return glib::ExitCode::FAILURE;
+        }
+        crate::bench::start(secs);
+        return glib::ExitCode::SUCCESS;
     }
     let first = !app.is_remote() && app.windows().is_empty();
     if first && floats_req.is_empty() {
@@ -512,10 +575,15 @@ pub fn run() -> glib::ExitCode {
         graph::set_history_secs(s.history_secs);
         graph::set_smooth(s.smooth);
         graph::set_line_px(s.line_px as f32);
+        graph::set_motion_step(s.motion_step as f32);
         theme::apply(&s.theme);
         theme::follow_system();
         let _ = sampler();
         setup_actions(app);
+        if crate::profile::enabled() {
+            crate::bench::start_gpu_report();
+            crate::bench::register_debug_action(app);
+        }
     });
     app.connect_command_line(handle_command_line);
     app.connect_shutdown(|_| QUITTING.with(|q| q.set(true)));

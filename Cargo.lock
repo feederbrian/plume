@@ -480,7 +480,7 @@ checksum = "f6b464fbc74e149a392436b17d523f769e057cb6877f6a5c4618bc6f11800548"
 
 [[package]]
 name = "plume"
-version = "0.2.1"
+version = "0.2.2"
 dependencies = [
  "gtk4",
  "libadwaita",
@@ -490,7 +490,7 @@ dependencies = [
 
 [[package]]
 name = "plume-core"
-version = "0.2.1"
+version = "0.2.2"
 dependencies = [
  "libc",
 ]

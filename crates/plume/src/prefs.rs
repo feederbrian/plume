@@ -129,6 +129,16 @@ pub fn show(parent: Option<&gtk::Window>) {
         },
     ));
     g.add(&combo(
+        "Graph motion",
+        "Smaller scroll steps look smoother but redraw more often",
+        &[("Smoothest", 0.25f64), ("Balanced", 1.0), ("Battery saver", 2.0)],
+        s.motion_step,
+        |v| {
+            settings::update(|s| s.motion_step = v);
+            graph::set_motion_step(v as f32);
+        },
+    ));
+    g.add(&combo(
         "Sampling rate",
         "How often CPU, memory, network, disk and GPU are measured",
         &[("4 Hz", 4.0f64), ("10 Hz", 10.0), ("20 Hz", 20.0), ("30 Hz", 30.0)],

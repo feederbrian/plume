@@ -70,18 +70,32 @@ second, all landing in the same frame, and they could stall the UI thread.
    held at the live edge. Columns live in a ring texture (RGBA32F, 2 rows:
    values, plus per-column min/max envelopes). A new sample recomputes and
    uploads only the few dozen columns it touches.
-2. **One draw per frame.** A `GtkGLArea` per graph runs one fragment shader
-   (`widgets/gl.rs`) over a full-screen triangle. The scroll position is a
-   uniform, so each pixel knows its exact sub-pixel data coordinate. Fill
-   coverage comes from the signed distance to the curve, line coverage from
-   the distance to the five nearby segments. Lines are exactly `line_px`
-   device pixels wide at any scroll offset: even motion, no resampling blur.
-3. **Early outs.** The envelope row lets most pixels decide with a single
-   texel fetch whether they're above the curve (draw nothing), deep inside the
-   fill (flat colour) or near the line (exact test).
-4. **Frame skipping.** A graph only re-renders when it moved at least a
-   quarter pixel, its data or axis changed, or the theme changed. The focused
-   window runs at up to 60 fps; floating readouts and background windows at 30.
+2. **One curve shader.** A `GtkGLArea` per graph runs one fragment shader
+   (`widgets/gl.rs`). The scroll position is a uniform, so each pixel knows
+   its exact sub-pixel data coordinate. Fill coverage comes from the signed
+   distance to the curve, line coverage from the distance to the five nearby
+   segments. Lines are exactly `line_px` device pixels wide at any scroll
+   offset: even motion, no resampling blur.
+3. **Shade only under the curves** (0.2.2). Most of a graph is empty space
+   above the curve, and in 0.2.0–0.2.1 the shader still ran there. Now the
+   framebuffer is cleared, the grid lines are drawn as 1 px quads, and the
+   curve shader runs on a triangle strip whose top follows the curves'
+   envelope in 8-pixel blocks. Blocks rather than single columns keep the
+   triangles wide: GPUs shade 2×2 pixel quads, so 1 px wide triangles would
+   waste half of every quad. The output matches the full-rectangle shader
+   (grid-line pixels differ by at most 2/255, from blending). Inside the
+   strip, the envelope lets most pixels decide with one texel fetch whether
+   they're above the curve, deep inside the fill or near the line.
+4. **Paced redraws** (0.2.2). A graph redraws when it has moved about one
+   device pixel (Preferences → Graph motion: ¼ px, 1 px or 2 px), or when its
+   data, axis or theme changed. Redraws land on a frame grid shared by the
+   whole window: every k-th frame, k a power of two, at least what the
+   frame-rate cap needs. Graphs with different speeds therefore redraw on the
+   same frames, so the window and the compositor redraw at the lower rate
+   too, and each step moves the curves by the same distance. At the default
+   1-minute scale on a 4K screen the Overview's graphs redraw 30 times a
+   second instead of 60; per-core graphs and floating readouts, being
+   narrower, about 8–15 times.
 5. **One context per window.** All graphs in a window share a GL context
    (each still renders into its own framebuffer), because a context per graph
    costs several MB. With a shared context the GL viewport is shared state, so
@@ -99,6 +113,8 @@ used automatically. `PLUME_GRAPH=gsk` forces it, for comparison.
 * Graphs re-render only when they visibly change (see above), at up to 60 fps
   in the focused window and 30 fps elsewhere. Every frame keeps the GPU awake
   for a moment, so frame count matters for battery more than per-frame cost.
+* Graphs scrolled out of view (the Overview is a scrolled page) skip all work,
+  data updates included, and redraw as soon as they're visible again.
 * The process scan runs only while a process tab or an inspector is open.
 * `/proc/<pid>/io` (one extra file per process) is read only on the Disk tab.
 * Socket attribution runs only on the Network tab.
@@ -208,6 +224,32 @@ CPU. CPU-side numbers are real; anything labelled "paint" is inflated.
 The graph shader ran 2,700 µs → 590 µs per draw on llvmpipe after
 specialising it for two series. On a GPU each draw is a few microseconds of
 CPU time.
+
+### 0.2.2: GPU time (`plume --bench`)
+
+`plume --bench` measures what matters on a real GPU: for each renderer
+variant it reads the GPU engine time of Plume's own DRM clients and of the
+compositor from `/proc/PID/fdinfo`, the per-client accounting `intel_gpu_top`
+uses, plus the window's redraw rate and Plume's CPU time. Run it with Plume
+closed.
+
+This VM has no GPU, so its GPU columns read n/a. Under llvmpipe, Plume's CPU
+time includes all rendering, which makes it a rough stand-in (Overview, 1×
+scale, 890×630 window, 12 s per variant):
+
+| variant | window redraws/s | graph draws/s | Plume CPU |
+|---|---|---|---|
+| 0.2.1 renderer | 32.8 | 121 | 79 % |
+| + skip off-screen graphs | 33.6 | 123 | 84 % |
+| + shade under the curves only | 31.8 | 120 | 75 % |
+| + 1 px paced redraws (default) | 11.1 | 30 | 23 % |
+
+Paced redraws dominate here because they remove whole frames: the shaders,
+GTK's compositing and the compositor's all scale with frames. Under llvmpipe,
+GTK's own compositing of the window costs far more than the graph shaders,
+so shading under the curves barely registers; on a GPU the balance is
+different, which is what the bench on real hardware shows. Every graph was
+visible in this window, so skipping off-screen graphs had nothing to skip.
 
 ### Collector
 
